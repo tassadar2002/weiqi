@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>围棋死活与对杀</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Ma+Shan+Zheng&family=Noto+Serif+SC:wght@400;700&family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <div class="ink-wash-bg"></div>
+    <div class="grain-overlay"></div>
+
+    <header>
+      <div class="title-group">
+        <h1 class="main-title">围棋死活与对杀</h1>
+        <p class="subtitle">Life &amp; Death · Capturing Race</p>
+      </div>
+      <div class="header-accent"></div>
+    </header>
+
+    <main>
+      <section id="board-section">
+        <div id="board-frame">
+          <div id="board-container">
+            <canvas id="board-canvas"></canvas>
+          </div>
+          <div id="board-shadow"></div>
+        </div>
+        <div id="move-indicator">
+          <span id="move-dot" class="layout"></span>
+          <span id="move-text">布局模式</span>
+        </div>
+      </section>
+
+      <aside id="sidebar">
+        <!-- 第 1 阶段：布局 -->
+        <div id="layout-controls" class="card">
+          <h3 class="section-title">① 布局模式</h3>
+          <p class="layout-hint">在棋盘上摆放黑白子，设置好题目后进入下一步。</p>
+          <div id="color-selector">
+            <button id="sel-black" class="tool-btn active-tool">
+              <span class="stone-icon black-stone"></span>
+              黑子
+            </button>
+            <button id="sel-white" class="tool-btn">
+              <span class="stone-icon white-stone"></span>
+              白子
+            </button>
+            <button id="sel-erase" class="tool-btn">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M18 6L6 18M6 6l12 12"/>
+              </svg>
+              擦除
+            </button>
+          </div>
+          <button id="btn-to-region" class="start-btn">下一步：设置落子点</button>
+        </div>
+
+        <!-- 第 2 阶段：设置落子点 -->
+        <div id="region-controls" class="card hidden">
+          <h3 class="section-title">② 设置落子点</h3>
+          <p class="layout-hint">点击切换可落子点（亮色点为可下，暗色为墙）。提子后原位置若在区域内仍可再下。</p>
+          <div class="region-btn-row">
+            <button id="btn-default-region" class="tool-btn">默认区域</button>
+            <button id="btn-clear-region" class="tool-btn">全部清空</button>
+            <button id="btn-all-region" class="tool-btn">全部可下</button>
+          </div>
+          <div class="region-btn-row">
+            <button id="btn-back-layout-from-region" class="ctrl-btn">返回布局</button>
+            <button id="btn-to-solve" class="start-btn">下一步：解题</button>
+          </div>
+        </div>
+
+        <!-- 第 3 阶段：解题 -->
+        <div id="play-controls" class="card hidden">
+          <h3 class="section-title">③ 解题（黑先）</h3>
+          <p id="classify-label" class="layout-hint">当前类型：—</p>
+          <button id="btn-autoplay" class="start-btn" style="margin-bottom:0.6rem;">最优解</button>
+          <div id="play-controls-inner">
+            <button id="btn-pick-target" class="ctrl-btn">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="8"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+              点选目标
+            </button>
+            <button id="btn-reset" class="ctrl-btn">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 12a9 9 0 1 1 9 9 9 9 0 0 1-6.36-2.64"/>
+                <path d="M3 3v6h6"/>
+              </svg>
+              返回布局
+            </button>
+          </div>
+        </div>
+
+        <div id="feedback" class="card feedback-card hidden">
+          <div id="feedback-icon"></div>
+          <p id="feedback-message"></p>
+        </div>
+
+        <div id="decision-log" class="card hidden">
+          <h3 class="section-title">决策与落子记录</h3>
+          <div id="log-list"></div>
+        </div>
+      </aside>
+    </main>
+
+    <footer>
+      <p>落子无悔</p>
+    </footer>
+  </div>
+
+  <script src="board.js"></script>
+  <script src="region.js"></script>
+  <script src="eyes.js"></script>
+  <script src="target.js"></script>
+  <script src="solver.js"></script>
+  <script src="renderer.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
