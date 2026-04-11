@@ -22,18 +22,24 @@ EMPTY = 0
 BOARD_SIZE = 10
 
 
-@dataclass
 class UndoInfo:
     """落子的撤销句柄。`captured` 是被提子的坐标和颜色，便于反向恢复。"""
-    x: int
-    y: int
-    color: int
-    captured: List[Tuple[int, int, int]] = field(default_factory=list)
-    prev_last_capture: int = -1
+    __slots__ = ("x", "y", "color", "captured", "prev_last_capture")
+
+    def __init__(self, x: int, y: int, color: int,
+                 captured: List[Tuple[int, int, int]],
+                 prev_last_capture: int):
+        self.x = x
+        self.y = y
+        self.color = color
+        self.captured = captured
+        self.prev_last_capture = prev_last_capture
 
 
 class Board:
     """10×10 棋盘。grid 用一维 list 存储，索引 = y * size + x。"""
+
+    __slots__ = ("size", "grid", "last_capture")
 
     def __init__(self, size: int = BOARD_SIZE):
         self.size = size
@@ -79,29 +85,72 @@ class Board:
           - group: 同色连通块的所有 (x,y) 坐标列表
           - libs:  该群的气集合（每个气存为扁平索引 y*size+x）
         若起点为空点，返回空数据。
+
+        此函数是热点：使用扁平索引 + bytearray visited + 内联 4 邻判断，避免
+        Python 生成器与元组分配开销。
         """
-        color = self.get(x, y)
+        size = self.size
+        grid = self.grid
+        i0 = y * size + x
+        color = grid[i0]
         if color == EMPTY:
             return [], set()
 
+        # 本地变量缓存（在 PyPy 下帮助 JIT；CPython 下减少属性查找）
+        sz_m1 = size - 1
+        visited = bytearray(size * size)
         group: List[Tuple[int, int]] = []
         libs: Set[int] = set()
-        visited: Set[Tuple[int, int]] = set()
-        stack: List[Tuple[int, int]] = [(x, y)]
+
+        stack: List[int] = [i0]
+        visited[i0] = 1
 
         while stack:
-            cx, cy = stack.pop()
-            if (cx, cy) in visited:
-                continue
-            cell = self.get(cx, cy)
-            if cell != color:
-                if cell == EMPTY:
-                    libs.add(cy * self.size + cx)
-                continue
-            visited.add((cx, cy))
+            pos = stack.pop()
+            # 由扁平索引还原 (x,y)
+            cy, cx = divmod(pos, size)
             group.append((cx, cy))
-            for nx, ny in self.neighbors(cx, cy):
-                stack.append((nx, ny))
+
+            # --- 北 ---
+            if cy > 0:
+                ni = pos - size
+                if not visited[ni]:
+                    s = grid[ni]
+                    if s == color:
+                        visited[ni] = 1
+                        stack.append(ni)
+                    elif s == EMPTY:
+                        libs.add(ni)
+            # --- 南 ---
+            if cy < sz_m1:
+                ni = pos + size
+                if not visited[ni]:
+                    s = grid[ni]
+                    if s == color:
+                        visited[ni] = 1
+                        stack.append(ni)
+                    elif s == EMPTY:
+                        libs.add(ni)
+            # --- 西 ---
+            if cx > 0:
+                ni = pos - 1
+                if not visited[ni]:
+                    s = grid[ni]
+                    if s == color:
+                        visited[ni] = 1
+                        stack.append(ni)
+                    elif s == EMPTY:
+                        libs.add(ni)
+            # --- 东 ---
+            if cx < sz_m1:
+                ni = pos + 1
+                if not visited[ni]:
+                    s = grid[ni]
+                    if s == color:
+                        visited[ni] = 1
+                        stack.append(ni)
+                    elif s == EMPTY:
+                        libs.add(ni)
 
         return group, libs
 
@@ -112,61 +161,89 @@ class Board:
         在 (x,y) 落子。原地修改棋盘，返回 UndoInfo 句柄。
         若非法（越界 / 占用 / 自杀 / 打劫禁着），返回 None。
         """
-        if not self.in_bounds(x, y) or self.get(x, y) != EMPTY:
+        size = self.size
+        grid = self.grid
+        if x < 0 or x >= size or y < 0 or y >= size:
+            return None
+        i = y * size + x
+        if grid[i] != EMPTY:
             return None
 
         prev_lc = self.last_capture
-        self.set(x, y, color)
+        grid[i] = color
         opp = -color
         captured: List[Tuple[int, int, int]] = []
+        sz_m1 = size - 1
 
-        # 检查 4 邻是否有对方无气群
-        for nx, ny in self.neighbors(x, y):
-            if self.get(nx, ny) == opp:
-                group, libs = self.group_and_libs(nx, ny)
-                if len(libs) == 0:
-                    for gx, gy in group:
-                        self.set(gx, gy, EMPTY)
-                        captured.append((gx, gy, opp))
+        # 检查 4 邻是否有对方无气群（内联 4 邻，避免生成器调用）
+        # 北
+        if y > 0 and grid[i - size] == opp:
+            group, libs = self.group_and_libs(x, y - 1)
+            if len(libs) == 0:
+                for gx, gy in group:
+                    grid[gy * size + gx] = EMPTY
+                    captured.append((gx, gy, opp))
+        # 南
+        if y < sz_m1 and grid[i + size] == opp:
+            group, libs = self.group_and_libs(x, y + 1)
+            if len(libs) == 0:
+                for gx, gy in group:
+                    grid[gy * size + gx] = EMPTY
+                    captured.append((gx, gy, opp))
+        # 西
+        if x > 0 and grid[i - 1] == opp:
+            group, libs = self.group_and_libs(x - 1, y)
+            if len(libs) == 0:
+                for gx, gy in group:
+                    grid[gy * size + gx] = EMPTY
+                    captured.append((gx, gy, opp))
+        # 东
+        if x < sz_m1 and grid[i + 1] == opp:
+            group, libs = self.group_and_libs(x + 1, y)
+            if len(libs) == 0:
+                for gx, gy in group:
+                    grid[gy * size + gx] = EMPTY
+                    captured.append((gx, gy, opp))
 
         # 自杀检测
         _, own_libs = self.group_and_libs(x, y)
         if len(own_libs) == 0:
             # 回滚
             for gx, gy, c in reversed(captured):
-                self.set(gx, gy, c)
-            self.set(x, y, EMPTY)
+                grid[gy * size + gx] = c
+            grid[i] = EMPTY
             return None
 
         # 简单 ko：当且仅当"自方为单子且仅提一子"时检查
-        own_is_single = all(
-            self.get(nx, ny) != color
-            for nx, ny in self.neighbors(x, y)
+        own_is_single = not (
+            (y > 0 and grid[i - size] == color) or
+            (y < sz_m1 and grid[i + size] == color) or
+            (x > 0 and grid[i - 1] == color) or
+            (x < sz_m1 and grid[i + 1] == color)
         )
         if len(captured) == 1 and own_is_single:
-            this_key = y * self.size + x
-            if prev_lc == this_key:
+            if prev_lc == i:
                 # 打劫禁着 → 回滚
                 for gx, gy, c in reversed(captured):
-                    self.set(gx, gy, c)
-                self.set(x, y, EMPTY)
+                    grid[gy * size + gx] = c
+                grid[i] = EMPTY
                 return None
             cx, cy, _ = captured[0]
-            self.last_capture = cy * self.size + cx
+            self.last_capture = cy * size + cx
         else:
             self.last_capture = -1
 
-        return UndoInfo(
-            x=x, y=y, color=color,
-            captured=captured,
-            prev_last_capture=prev_lc,
-        )
+        return UndoInfo(x, y, color, captured, prev_lc)
 
     def undo(self, u: UndoInfo) -> None:
         """撤销 play_undoable 的修改。"""
-        self.set(u.x, u.y, EMPTY)
-        for gx, gy, c in reversed(u.captured):
-            self.set(gx, gy, c)
+        size = self.size
+        grid = self.grid
+        grid[u.y * size + u.x] = EMPTY
+        captured = u.captured
+        for k in range(len(captured) - 1, -1, -1):
+            gx, gy, c = captured[k]
+            grid[gy * size + gx] = c
         self.last_capture = u.prev_last_capture
 
     def play(self, x: int, y: int, color: int) -> Optional[int]:
