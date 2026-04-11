@@ -15,6 +15,8 @@ class BoardRenderer {
     this.regionMask = null;
     this.moveHistory = [];    // [{x, y, color: B|W, number}]
     this.targetCoord = null;  // [x, y]：目标群代表子坐标
+    this.targetGroupCoords = null;  // 后端返回的目标群成员列表 [[x,y],...]
+    this.targetColor = null;  // 目标群颜色（用于校验仍存活）
     this.resize();
   }
 
@@ -87,13 +89,14 @@ class BoardRenderer {
   }
 
   // 高亮目标群：描红环 + 右上角三角标记
+  // 组成员由后端通过 targetGroupCoords 提供，避免前端再做规则计算
   drawTargetHighlight(ctx, board) {
     if (!this.targetCoord) return;
-    const [tx, ty] = this.targetCoord;
-    const color = board.get(tx, ty);
-    if (color === E) return;  // 目标已被提
-    const { group } = board.groupAndLibs(tx, ty);
+    const group = this.targetGroupCoords;
     if (!group || group.length === 0) return;
+    const [tx, ty] = this.targetCoord;
+    // 校验代表子是否仍在场（被提则不画）
+    if (this.targetColor != null && board.get(tx, ty) !== this.targetColor) return;
 
     ctx.save();
     const r = this.cellSize * 0.44;

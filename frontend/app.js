@@ -1,30 +1,37 @@
 // ============================================================
-// 应用控制器：布局 → 设置落子点 → 解题（df-pn）
+// 应用控制器（前后端分离版）
+//
+// 所有 Go 规则与 df-pn 求解都在 Python 后端 (/api/*)。前端只负责：
+//   - 渲染棋盘
+//   - 收集用户事件
+//   - 维护展示用的本地状态（落子记录、决策日志）
+//
+// 与后端的所有交互都是异步的，通过 api.js 中的 API.* 方法。
 // ============================================================
 
 const SOLVE_OPTIONS = {
-  maxTimeMs: 120000,   // 单步最长 2 分钟
-  maxNodes: 10000000,  // 1000 万节点
+  maxTimeMs: 120000,
+  maxNodes: 10000000,
   maxDepth: 60,
 };
 
 class App {
   constructor() {
-    this.board = new SimBoard(BOARD_SIZE);
+    this.board = new ClientBoard(BOARD_SIZE);
     this.regionMask = createDefaultMask(BOARD_SIZE);
     this.canvas = document.getElementById('board-canvas');
     this.renderer = new BoardRenderer(this.canvas, BOARD_SIZE);
 
-    this.mode = 'layout';              // 'layout' | 'region' | 'solve' | 'pick-target'
+    this.mode = 'layout';   // 'layout' | 'region' | 'solve' | 'pick-target'
     this.placementColor = 'black';
-    this.initialSnapshot = null;       // {board, regionMask}
-    this.targetInfo = null;            // selectTarget 结果
+    this.initialSnapshot = null;
+    this.targetInfo = null;
     this.waitingForAI = false;
     this.autoplayTimer = null;
-    this.autoplayColor = B;            // 自动对弈时下一个落子方
-    this.moveHistory = [];             // [{x, y, color, number}]
-    this.moveCounter = 0;              // 持久步数计数器
-    this.decisionLog = [];             // 决策/落子记录
+    this.autoplayColor = B;
+    this.moveHistory = [];
+    this.moveCounter = 0;
+    this.decisionLog = [];
 
     this.loadInitialSetup();
     this.bindEvents();
@@ -122,7 +129,9 @@ class App {
     }
   }
 
-  // ===== 模式切换 =====
+  // ============================================================
+  // 模式切换
+  // ============================================================
 
   enterLayoutMode() {
     this.stopAutoplay();
@@ -137,12 +146,14 @@ class App {
     this.waitingForAI = false;
 
     if (this.initialSnapshot) {
-      this.board = this.initialSnapshot.board.clone();
+      this.board.replaceFromArray(this.initialSnapshot.boardArr, -1);
       this.regionMask = cloneMask(this.initialSnapshot.regionMask);
       this.initialSnapshot = null;
     }
     this.targetInfo = null;
     this.renderer.targetCoord = null;
+    this.renderer.targetGroupCoords = null;
+    this.renderer.targetColor = null;
 
     document.getElementById('layout-controls').classList.remove('hidden');
     document.getElementById('region-controls').classList.add('hidden');
@@ -166,10 +177,8 @@ class App {
     document.getElementById('play-controls').classList.add('hidden');
     this.hideFeedback();
 
-    const dot = document.getElementById('move-dot');
-    const text = document.getElementById('move-text');
-    dot.className = 'layout';
-    text.textContent = '点击设置落子点';
+    document.getElementById('move-dot').className = 'layout';
+    document.getElementById('move-text').textContent = '点击设置落子点';
 
     this.syncRendererMask();
     this.renderBoard();
@@ -181,9 +190,8 @@ class App {
       return;
     }
 
-    // 保存快照
     this.initialSnapshot = {
-      board: this.board.clone(),
+      boardArr: this.board.toArray(),
       regionMask: cloneMask(this.regionMask),
     };
     this.mode = 'solve';
@@ -196,9 +204,10 @@ class App {
     this.decisionLog = [];
     document.getElementById('btn-autoplay').textContent = '最优解';
 
-    // 目标由用户手动指定（进入解题后强制先选目标）
     this.targetInfo = null;
     this.renderer.targetCoord = null;
+    this.renderer.targetGroupCoords = null;
+    this.renderer.targetColor = null;
     this.updateTargetLabel();
 
     document.getElementById('layout-controls').classList.add('hidden');
@@ -211,11 +220,13 @@ class App {
     this.syncRendererMask();
     this.renderBoard();
 
-    // 自动进入选目标子模式
+    // 强制进入"点选目标"子模式
     this.enterPickTargetMode();
   }
 
-  // ===== 决策日志 =====
+  // ============================================================
+  // 决策日志
+  // ============================================================
 
   logEntry(entry) {
     this.decisionLog.push(entry);
@@ -225,27 +236,24 @@ class App {
   logTargetDecision() {
     const t = this.targetInfo;
     if (!t) return;
-    const defStr = t.defenderColor === B ? '黑' : '白';
-    const atkStr = t.attackerColor === B ? '黑' : '白';
-    const [tx, ty] = t.targetCoord;
-    const mark = t.userPicked ? ' <span class="cand" style="background:rgba(91,140,111,0.2)">用户指定</span>' : '';
-    const candsHtml = (t.candidates || []).map((c, i) => {
-      const cStr = c.color === B ? '黑' : '白';
-      const marker = i === 0 ? '✓ ' : '';
-      return `<span class="cand">${marker}${cStr}@(${c.pos[0]},${c.pos[1]}) ${c.stones}子/${c.libs}气/${c.eyes}眼</span>`;
-    }).join('');
+    const defStr = t.defender_color === B ? '黑' : '白';
+    const atkStr = t.attacker_color === B ? '黑' : '白';
+    const [tx, ty] = t.target_coord;
+    const mark = t.user_picked
+      ? ' <span class="cand" style="background:rgba(91,140,111,0.2)">用户指定</span>'
+      : '';
     this.logEntry({
       type: 'target',
       main: `选定目标：${defStr}@(${tx},${ty})`,
-      meta: `${t.targetStones} 子 · ${t.targetLibs} 气 · ${t.targetEyes} 眼`,
-      sub: `防方 ${defStr} · 攻方 ${atkStr}${mark}` + (candsHtml ? '<br>候选：' + candsHtml : ''),
+      meta: `${t.target_stones} 子 · ${t.target_libs} 气 · ${t.target_eyes} 眼`,
+      sub: `防方 ${defStr} · 攻方 ${atkStr}${mark}`,
     });
   }
 
   logMoveDecision(color, r) {
     const step = this.moveCounter;
     const side = color === B ? '黑' : '白';
-    const role = color === this.targetInfo.attackerColor ? '攻' : '防';
+    const role = color === this.targetInfo.attacker_color ? '攻' : '防';
     let tag, tagClass;
     if (r.move && r.move.certain) {
       tag = '必胜';
@@ -270,7 +278,7 @@ class App {
       main: `${side}${role} ${posStr}`,
       step,
       tag, tagClass,
-      meta: `${resultStr} · pn=${pnStr} dn=${dnStr} · ${r.nodes.toLocaleString()} 节点 · ${(r.elapsedMs / 1000).toFixed(2)}s`,
+      meta: `${resultStr} · pn=${pnStr} dn=${dnStr} · ${r.nodes.toLocaleString()} 节点 · ${(r.elapsed_ms / 1000).toFixed(2)}s`,
       sub: r.move.certain ? '按证明树推进' : '走顽强抵抗着',
     });
   }
@@ -312,7 +320,6 @@ class App {
       }
       return '';
     }).join('');
-    // 自动滚到底部
     list.scrollTop = list.scrollHeight;
   }
 
@@ -321,9 +328,12 @@ class App {
     return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
   }
 
-  // 记录一手到 moveHistory；使用持久计数器，幸存子保留原序号
+  // ============================================================
+  // 落子历史与目标标签
+  // ============================================================
+
   recordMove(x, y, color) {
-    // 清理：已被提子的历史条目 + 同点旧条目（被当前手覆盖）
+    // 清理已被提子的旧记录 + 同位置覆盖
     for (let i = this.moveHistory.length - 1; i >= 0; i--) {
       const m = this.moveHistory[i];
       const stale = (this.board.get(m.x, m.y) !== m.color) || (m.x === x && m.y === y);
@@ -334,7 +344,6 @@ class App {
     this.renderer.moveHistory = this.moveHistory;
   }
 
-  // 统计落子区域内的空位数（两方的合法落子点上界）
   countRegionEmpty() {
     let n = 0;
     for (let i = 0; i < this.regionMask.length; i++) {
@@ -349,22 +358,33 @@ class App {
     const el = document.getElementById('classify-label');
     const regionTotal = maskCellCount(this.regionMask);
     const empty = this.countRegionEmpty();
-    const bLegal = this.board.legalMovesInRegion(B, this.regionMask).length;
-    const wLegal = this.board.legalMovesInRegion(W, this.regionMask).length;
     const statsLine = `<div style="margin-top:0.25rem;font-weight:400;color:var(--ink-medium);font-size:0.78rem;">` +
-      `区域 ${regionTotal} 格 · 空位 ${empty} · 合法 黑${bLegal}/白${wLegal}</div>`;
+      `区域 ${regionTotal} 格 · 空位 ${empty}</div>`;
     if (!t) {
       el.innerHTML = `<div style="color:var(--vermillion);">未选目标（请点选棋子）</div>` + statsLine;
       return;
     }
-    const defStr = t.defenderColor === B ? '黑' : '白';
-    const atkStr = t.attackerColor === B ? '黑' : '白';
-    const [tx, ty] = t.targetCoord;
+    const defStr = t.defender_color === B ? '黑' : '白';
+    const atkStr = t.attacker_color === B ? '黑' : '白';
+    const [tx, ty] = t.target_coord;
     el.innerHTML =
-      `<div>目标：${defStr}@(${tx},${ty}) ${t.targetStones}子/${t.targetLibs}气 · 攻方：${atkStr}</div>` + statsLine;
+      `<div>目标：${defStr}@(${tx},${ty}) ${t.target_stones}子/${t.target_libs}气 · 攻方：${atkStr}</div>` + statsLine;
   }
 
-  // ===== 点击处理 =====
+  displaySolveMeta(r) {
+    let label = '';
+    if (r.result === 'ATTACKER_WINS') label = '攻方必胜';
+    else if (r.result === 'DEFENDER_WINS') label = '防方必胜';
+    else label = '未证明';
+    const meta = `${label} · ${r.nodes.toLocaleString()} 节点 · ${(r.elapsed_ms / 1000).toFixed(1)}s`;
+    this.updateTargetLabel();
+    const el = document.getElementById('classify-label');
+    el.innerHTML += `<div style="margin-top:0.25rem;font-weight:400;color:var(--jade-dark);font-size:0.78rem;">上一手：${meta}</div>`;
+  }
+
+  // ============================================================
+  // 点击事件分发
+  // ============================================================
 
   onCanvasClick(e) {
     const rect = this.canvas.getBoundingClientRect();
@@ -405,7 +425,11 @@ class App {
     this.renderBoard();
   }
 
-  onSolveClick(bx, by) {
+  // ============================================================
+  // 解题阶段：手动落子
+  // ============================================================
+
+  async onSolveClick(bx, by) {
     if (this.waitingForAI) return;
     if (this.autoplayTimer) return;
     if (!this.targetInfo) {
@@ -418,63 +442,97 @@ class App {
     }
     if (this.board.get(bx, by) !== E) return;
 
-    const captured = this.board.play(bx, by, B);
-    if (captured < 0) {
-      this.showFeedback('incorrect', '非法落子（自杀或打劫禁着）。');
+    this.waitingForAI = true;
+    let r;
+    try {
+      r = await API.play(
+        this.board.toArray(),
+        this.board.lastCapture,
+        bx, by, B,
+        this.targetInfo.target_coord,
+      );
+    } catch (err) {
+      this.waitingForAI = false;
+      this.showFeedback('incorrect', '后端通信失败：' + err.message);
       return;
     }
-    this.recordMove(bx, by, B);
+    this.waitingForAI = false;
+
+    if (!r.ok) {
+      this.showFeedback('incorrect', r.error || '非法落子');
+      return;
+    }
+    this.applyPlayResult(bx, by, B, r);
     this.logEntry({
       type: 'move',
       color: B,
       main: `黑手动 (${bx},${by})`,
       step: this.moveCounter,
       tag: '用户', tagClass: 'tag-probe',
-      meta: `用户手动落子`,
+      meta: '用户手动落子',
     });
     this.autoplayColor = W;
-    this.hideFeedback();
 
-    this.renderer.lastMove = [bx, by, 'black'];
-    this.renderer.ghostStone = null;
-    this.renderBoard();
+    if (this.checkPostMoveTerminal(r)) return;
 
-    if (this.checkPostMoveTerminal()) return;
-
-    this.waitingForAI = true;
     document.getElementById('move-text').textContent = '白棋思考中...';
+    this.waitingForAI = true;
     setTimeout(() => this.computeReply(W), 50);
   }
 
-  // 走完一手后的终局检测；返回 true 表示已终局
-  checkPostMoveTerminal() {
-    const [tx, ty] = this.targetInfo.targetCoord;
-    if (this.board.get(tx, ty) !== this.targetInfo.defenderColor) {
+  // 把后端 /api/play 的成功响应应用到本地状态
+  applyPlayResult(x, y, color, r) {
+    this.board.replaceFromArray(r.new_board, r.last_capture);
+    this.recordMove(x, y, color);
+    this.renderer.lastMove = [x, y, color === B ? 'black' : 'white'];
+    if (r.target_status) {
+      this.renderer.targetGroupCoords = r.target_status.group;
+    }
+    this.hideFeedback();
+    this.renderBoard();
+  }
+
+  // 由 r.target_status 判断是否到达棋盘终局；返回 true 表示终局已处理
+  checkPostMoveTerminal(r) {
+    if (!r.target_status) return false;
+    if (r.target_status.captured) {
       this.showTerminal('TARGET_CAPTURED');
       return true;
     }
-    const tgt = getTargetGroup(this.board, this.targetInfo.targetCoord);
-    if (tgt) {
-      const eyes = countGroupRealEyes(this.board, tgt);
-      if (eyes >= 2) {
-        this.showTerminal('TARGET_ALIVE');
-        return true;
-      }
+    if (r.target_status.alive) {
+      this.showTerminal('TARGET_ALIVE');
+      return true;
     }
     return false;
   }
 
-  // 统一的一方落子：跑 df-pn 再应用结果
-  // 只在棋盘实际终局（提子 / 双眼）或真无合法着法时停止
-  computeReply(color) {
-    const r = solveDfpn(this.board, this.regionMask, this.targetInfo, color, SOLVE_OPTIONS);
+  // ============================================================
+  // 解题阶段：调 solver 应手
+  // ============================================================
+
+  async computeReply(color) {
+    let r;
+    try {
+      r = await API.solve(
+        this.board.toArray(),
+        this.board.lastCapture,
+        Array.from(this.regionMask),
+        this.targetInfo,
+        color,
+        SOLVE_OPTIONS,
+      );
+    } catch (err) {
+      this.waitingForAI = false;
+      this.stopAutoplay();
+      this.showFeedback('incorrect', '后端通信失败：' + err.message);
+      return;
+    }
     this.displaySolveMeta(r);
 
     if (!r.move) {
-      // 真正无合法着法：判定当前方直接输
       this.waitingForAI = false;
       this.stopAutoplay();
-      if (color === this.targetInfo.attackerColor) {
+      if (color === this.targetInfo.attacker_color) {
         this.showFeedback('incorrect', '攻方无合法着法，防方胜。');
         this.logTerminal('ATK_NO_MOVE');
       } else {
@@ -486,7 +544,6 @@ class App {
     }
 
     if (r.move.pass) {
-      // 防方确定安全（pass 也必胜）→ 已活，停止
       this.waitingForAI = false;
       this.stopAutoplay();
       this.showFeedback('correct', '防方已安全，无需落子（pass）。');
@@ -496,52 +553,52 @@ class App {
       return;
     }
 
-    const cap = this.board.play(r.move.x, r.move.y, color);
-    if (cap < 0) {
+    // 实际把这一手发给后端 /api/play 应用
+    let pr;
+    try {
+      pr = await API.play(
+        this.board.toArray(),
+        this.board.lastCapture,
+        r.move.x, r.move.y, color,
+        this.targetInfo.target_coord,
+      );
+    } catch (err) {
       this.waitingForAI = false;
       this.stopAutoplay();
-      this.showFeedback('incorrect', `落子(${r.move.x},${r.move.y})非法。`);
+      this.showFeedback('incorrect', '后端通信失败：' + err.message);
       return;
     }
-    this.recordMove(r.move.x, r.move.y, color);
+    if (!pr.ok) {
+      this.waitingForAI = false;
+      this.stopAutoplay();
+      this.showFeedback('incorrect', `落子(${r.move.x},${r.move.y})非法：${pr.error}`);
+      return;
+    }
+    this.applyPlayResult(r.move.x, r.move.y, color, pr);
     this.logMoveDecision(color, r);
-
-    this.renderer.lastMove = [r.move.x, r.move.y, color === B ? 'black' : 'white'];
-    this.renderBoard();
-    const certaintyTag = r.move.certain ? '必胜' : (r.result === 'UNPROVEN' ? '试探' : '顽抗');
-    console.log(`[app] ${color === B ? '黑' : '白'}棋落子: (${r.move.x}, ${r.move.y}) [${certaintyTag}]`);
 
     this.waitingForAI = false;
     this.autoplayColor = -color;
 
-    // 棋盘实际终局检查
-    if (this.checkPostMoveTerminal()) return;
+    if (this.checkPostMoveTerminal(pr)) return;
 
     document.getElementById('move-text').textContent =
       '轮到' + (this.autoplayColor === B ? '黑' : '白') + '棋';
   }
 
-  displaySolveMeta(r) {
-    let label = '';
-    if (r.result === 'ATTACKER_WINS') label = '攻方必胜';
-    else if (r.result === 'DEFENDER_WINS') label = '防方必胜';
-    else label = '未证明';
-    const meta = `${label} · ${r.nodes.toLocaleString()} 节点 · ${(r.elapsedMs / 1000).toFixed(1)}s`;
-    this.updateTargetLabel();
-    const el = document.getElementById('classify-label');
-    el.innerHTML += `<div style="margin-top:0.25rem;font-weight:400;color:var(--jade-dark);font-size:0.78rem;">上一手：${meta}</div>`;
-  }
-
-  // ===== 手动点选目标 =====
+  // ============================================================
+  // 手动选目标
+  // ============================================================
 
   enterPickTargetMode() {
-    if (this.mode !== 'solve') return;
+    if (this.mode !== 'solve' && this.mode !== 'pick-target') return;
     if (this.autoplayTimer) this.stopAutoplay();
     if (this.waitingForAI) return;
     this.mode = 'pick-target';
     this.canvas.style.cursor = 'crosshair';
     document.getElementById('move-text').textContent = '点击任意棋子设为目标';
-    this.showFeedback('correct', '请点击你想作为目标的棋子（黑子=黑方防守，白子=白方防守）。点击空点取消。');
+    this.showFeedback('correct',
+      '请点击你想作为目标的棋子（黑子=黑方防守，白子=白方防守）。点击空点取消。');
   }
 
   exitPickTargetMode() {
@@ -551,36 +608,47 @@ class App {
     document.getElementById('move-text').textContent = this.targetInfo ? '轮到黑棋' : '未选目标';
   }
 
-  onPickTargetClick(bx, by) {
+  async onPickTargetClick(bx, by) {
     const stone = this.board.get(bx, by);
     if (stone === E) {
-      // 点空点 → 取消
       this.exitPickTargetMode();
       return;
     }
-
-    const result = makeTargetFromStone(this.board, this.regionMask, bx, by);
+    let result;
+    try {
+      result = await API.makeTarget(
+        this.board.toArray(),
+        Array.from(this.regionMask),
+        bx, by,
+      );
+    } catch (err) {
+      this.showFeedback('incorrect', '后端通信失败：' + err.message);
+      return;
+    }
     if (result.error) {
       this.showFeedback('incorrect', result.error);
       return;
     }
 
-    // 目标切换：恢复布局快照，清空棋局进度
+    // 切换目标 → 恢复初始局面（避免历史走法和新目标矛盾）
     if (this.initialSnapshot) {
-      this.board = this.initialSnapshot.board.clone();
+      this.board.replaceFromArray(this.initialSnapshot.boardArr, -1);
       this.regionMask = cloneMask(this.initialSnapshot.regionMask);
     }
     this.targetInfo = result;
-    this.renderer.targetCoord = result.targetCoord;
+    this.renderer.targetCoord = result.target_coord;
+    this.renderer.targetColor = result.defender_color;
+    this.renderer.targetGroupCoords = result.target_status
+      ? result.target_status.group
+      : (result.group || []);
     this.moveHistory = [];
     this.moveCounter = 0;
     this.renderer.moveHistory = this.moveHistory;
     this.renderer.lastMove = null;
     this.autoplayColor = B;
 
-    // 重新记录快照（目标已变，但棋盘回到初始）
     this.initialSnapshot = {
-      board: this.board.clone(),
+      boardArr: this.board.toArray(),
       regionMask: cloneMask(this.regionMask),
     };
 
@@ -591,7 +659,9 @@ class App {
     this.exitPickTargetMode();
   }
 
-  // ===== 自动对弈（最优解）=====
+  // ============================================================
+  // 自动对弈
+  // ============================================================
 
   toggleAutoplay() {
     if (this.autoplayTimer) {
@@ -608,7 +678,6 @@ class App {
       this.showFeedback('incorrect', '请先点选目标棋子。');
       return;
     }
-
     document.getElementById('btn-autoplay').textContent = '停止自动';
     this.hideFeedback();
     this.autoplayTimer = true;
@@ -626,26 +695,20 @@ class App {
 
   scheduleAutoplayStep(delayMs) {
     if (!this.autoplayTimer) return;
-    this.autoplayTimer = setTimeout(() => {
+    this.autoplayTimer = setTimeout(async () => {
       if (!this.autoplayTimer) return;
-      this.autoplayStep();
+      await this.autoplayStep();
       if (this.autoplayTimer) this.scheduleAutoplayStep(2000);
     }, delayMs);
   }
 
-  autoplayStep() {
+  async autoplayStep() {
     if (this.waitingForAI) return;
-    if (this.checkPostMoveTerminal()) {
-      this.stopAutoplay();
-      return;
-    }
-
     const color = this.autoplayColor;
     document.getElementById('move-text').textContent =
       (color === B ? '黑' : '白') + '棋思考中...';
     this.waitingForAI = true;
-    // 让 UI 立即刷新再搜索
-    setTimeout(() => this.computeReply(color), 20);
+    await this.computeReply(color);
   }
 
   showTerminal(type) {
@@ -658,6 +721,10 @@ class App {
     document.getElementById('move-text').textContent = '对局结束';
     this.stopAutoplay();
   }
+
+  // ============================================================
+  // 鼠标 hover 提示
+  // ============================================================
 
   onCanvasMouseMove(e) {
     const rect = this.canvas.getBoundingClientRect();
@@ -683,7 +750,6 @@ class App {
         this.renderer.ghostStone = null;
       }
     }
-
     this.renderBoard();
   }
 

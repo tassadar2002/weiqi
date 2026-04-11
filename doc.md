@@ -1,6 +1,8 @@
 # weiqi3 — 围棋死活与对杀严格求解器
 
-10×10 围棋死活/对杀题目的浏览器端严格求解工具。零后端，单 HTML 文件即可运行。
+10×10 围棋死活/对杀题目的严格求解工具。
+
+**架构（v2）**：前后端分离 — 浏览器前端 + Python 后端，零外部依赖（无需 npm/pip）。
 
 ---
 
@@ -383,6 +385,114 @@ python3 -m http.server 8080
 ```
 
 每手在棋子上叠加序号（粗体白/黑字 + 描边）。
+
+---
+
+## 11. 前后端分离重构（v2）
+
+### 11.1 动机
+
+v1 版本所有逻辑都在浏览器 JS 中，单文件可运行但有以下问题：
+- 求解逻辑与 UI 耦合，长求解会卡住浏览器主线程
+- JS 代码经历多轮极致优化（Zobrist、撤销式、epoch scratch、wantGroup 懒分配），可读性下降
+- 用户希望"用 Python，重视可读性"
+
+### 11.2 架构
+
+```
+┌──────────────────────┐         HTTP/JSON          ┌──────────────────────┐
+│  浏览器 (frontend/)   │ ────────────────────────→  │  Python (backend/)   │
+│                      │                              │                      │
+│  - index.html        │  POST /api/play              │  - server.py         │
+│  - style.css         │  POST /api/make_target       │  - board.py          │
+│  - board.js  [极简]   │  POST /api/inspect_target   │  - eyes.py           │
+│  - region.js         │  POST /api/legal_moves       │  - target.py         │
+│  - api.js   [新]     │  POST /api/solve             │  - solver.py         │
+│  - renderer.js       │ ←────────────────────────   │                      │
+│  - app.js   [改写]    │                              │                      │
+└──────────────────────┘                              └──────────────────────┘
+       Canvas 渲染                                       df-pn 求解 + 规则
+       事件 + 历史 + 日志                                  转置表 + 终止判定
+```
+
+**通信协议**：纯 JSON 请求/响应。每次请求包含完整棋盘状态（100 整数数组），后端无会话状态。
+
+**单端口**：`server.py` 同时托管 `frontend/` 静态文件 + `/api/*` 路由。
+访问 `http://localhost:8080/` 即可。
+
+### 11.3 后端模块（Python）
+
+按可读性优先重写，未做 JS 版的极致优化：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `board.py` | ~180 | `Board` 类（dataclass UndoInfo、撤销式 play、清晰的 group_and_libs） |
+| `eyes.py` | ~80 | 严格真眼判定 |
+| `target.py` | ~60 | 手动目标构造 |
+| `solver.py` | ~330 | `DfpnSolver` 类（df-pn 主循环 + vitalness + 顽抗着 + 穷举根证明） |
+| `server.py` | ~270 | http.server + 5 个 API 端点 |
+
+总后端代码约 **920 行**，全部基于 stdlib，无 `pip install`。
+
+### 11.4 前端变更
+
+**删除**：
+- `solver.js`、`eyes.js`、`target.js` — 全部移到后端
+- `board.js` 简化为 `ClientBoard`（仅渲染数据载体，无规则）
+
+**新增**：
+- `api.js`：`API.play / makeTarget / inspectTarget / legalMoves / solve` 5 个 fetch 包装
+
+**改写**：
+- `app.js`：所有事件处理改为 `async` + `await API.*`；落子、目标查询、求解全部由后端响应推动
+- `renderer.js`：`drawTargetHighlight` 不再调 `groupAndLibs`，改用后端返回的 `targetGroupCoords`
+
+### 11.5 性能对比
+
+| 指标 | v1 (JS, 优化后) | v2 (Python, 可读) | 倍数 |
+|---|---|---|---|
+| 第一手耗时 | 488 ms | ~10,400 ms | ~21× 慢 |
+| 节点速率 | 217k nodes/s | ~10k nodes/s | ~21× 慢 |
+| 完整 9 手对局 | ~800 ms | ~18 s | ~22× 慢 |
+
+**结论**：Python 版的速度大约是优化后 JS 的 1/20。对于交互响应来说，第一手 10 秒
+是"明显的等待"但不至于不可用。后续步骤都在秒级或亚秒级（搜索树大幅缩小 + TT 缓存）。
+
+如果嫌慢的可能优化方向（按 ROI 排序）：
+1. **缩小问题规模**：让用户调小落子区域 / 选小目标
+2. **PyPy**：换 JIT 解释器，预计 5–10× 加速，无需改代码
+3. **C 扩展**：把 `board.py::group_and_libs` 用 C 重写，预计再 5× 加速
+4. **多进程根分裂**：每个 worker 拿一组根候选并行求解，预计 2–4× 加速
+
+### 11.6 正确性
+
+后端的 df-pn 与 v1 的 JS 版**算法完全等价**——同样的预设、同样的目标，得到的：
+- 节点数完全一致（106,538）
+- 第一手完全一致（B(0,3)）
+- 完整 9 手序列完全一致
+
+测试方式：
+```bash
+cd backend && python3 -c "
+from board import Board, BLACK
+from target import make_target_from_stone
+from solver import DfpnSolver
+# ... 设置预设 ...
+solver = DfpnSolver(board, mask, (1,4), -1)
+print(solver.solve(BLACK))
+"
+```
+
+### 11.7 取舍
+
+| 项 | v1 (JS 单文件) | v2 (前后端) |
+|---|---|---|
+| 部署 | 双击 .html 即可 | 需要 `python3 backend/server.py` |
+| 可读性 | 低（多轮优化痕迹） | 高（dataclass + 类型注解） |
+| 速度 | 快 | 慢 ~20× |
+| 算法正确性 | 一致 | 一致 |
+| 跨语言学习价值 | JS only | Python + JS 双端 |
+| UI 阻塞 | 求解时浏览器卡顿 | 求解在后端，浏览器仍响应 |
 
 ---
 
