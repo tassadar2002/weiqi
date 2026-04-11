@@ -16,6 +16,8 @@ df-pn (Depth-First Proof Number) 求解器
 
 特性：
   - 转置表 (TT) 缓存每个 (局面, 行棋方) 的 pn/dn
+  - **跨请求 TT 缓存**：同一 (region, target, attacker) 组合下，多次 solve 共用一张 TT。
+    适用于自动对弈场景——连续 N 手都是同一棵证明树的子局面，复用率极高。
   - 防方允许 pass（处理 seki / 双活）
   - 路径深度上限避免死循环
   - 节点 / 时间双预算
@@ -34,6 +36,49 @@ from eyes import count_real_eyes, get_target_group
 
 
 DFPN_INF = 10**9
+
+
+# ============================================================
+# 跨请求 TT 缓存
+# ============================================================
+#
+# key:   (region_fingerprint, target_coord, attacker_color)
+# value: Dict[position_key, (pn, dn)]
+#
+# 场景：自动对弈 9 手都是同一道题（同 region / target / attacker），
+# 每个后续局面都是前一手的子状态，TT 命中率极高。
+#
+# 内存限制：
+#   - 单张 TT 超过 MAX_ENTRIES → 丢弃（防止无限增长）
+#   - 缓存中不同 key 超过 MAX_TABLES → 按插入顺序淘汰最旧的
+#
+# 注意：Python stdlib HTTPServer 单线程处理请求，无需加锁。
+# 若改用 ThreadingHTTPServer 则需用 threading.Lock 保护。
+# ============================================================
+
+_TT_CACHE: Dict[Tuple[str, Tuple[int, int], int],
+                Dict[str, Tuple[int, int]]] = {}
+_TT_MAX_ENTRIES_PER_TABLE = 500_000
+_TT_MAX_TABLES = 8
+
+
+def _region_fingerprint(region_mask: List[int]) -> str:
+    """把 region_mask 转成紧凑字符串 key（100 字符）。"""
+    return "".join("1" if c else "0" for c in region_mask)
+
+
+def clear_tt_cache() -> None:
+    """调试/测试用：清空所有跨请求 TT。"""
+    _TT_CACHE.clear()
+
+
+def tt_cache_stats() -> dict:
+    """返回缓存状态：表数量、每表条目数。"""
+    return {
+        "tables": len(_TT_CACHE),
+        "sizes": {str(k): len(v) for k, v in _TT_CACHE.items()},
+        "total_entries": sum(len(v) for v in _TT_CACHE.values()),
+    }
 
 
 class _Timeout(Exception):
@@ -55,7 +100,8 @@ class DfpnSolver:
                  target_coord: Tuple[int, int], attacker_color: int,
                  max_nodes: int = 5_000_000,
                  max_time_ms: int = 60_000,
-                 max_depth: int = 60):
+                 max_depth: int = 60,
+                 reuse_tt: bool = True):
         self.board = board
         self.region_mask = region_mask
         self.target_coord = target_coord
@@ -64,10 +110,22 @@ class DfpnSolver:
         self.max_nodes = max_nodes
         self.max_time_ms = max_time_ms
         self.max_depth = max_depth
+        self.reuse_tt = reuse_tt
 
-        self.tt: Dict[str, Tuple[int, int]] = {}
+        # 跨请求 TT 缓存：相同 (region, target, attacker) 复用一张 TT
+        self._cache_key = (
+            _region_fingerprint(region_mask),
+            tuple(target_coord),
+            int(attacker_color),
+        )
+        if reuse_tt:
+            self.tt: Dict[str, Tuple[int, int]] = _TT_CACHE.get(self._cache_key, {})
+        else:
+            self.tt = {}
+
         self.nodes = 0
         self.start_time = 0.0
+        self.tt_hits_at_start = len(self.tt)  # 统计：本次开始时 TT 已有多少条目
 
         # 计算根目标的气集合，用于 vitalness（棋形要点破平）
         root_target = get_target_group(board, target_coord)
@@ -82,9 +140,9 @@ class DfpnSolver:
     def solve(self, current_turn: int) -> dict:
         """
         从 current_turn 行棋的局面开始求解。
-        返回字典字段：result, move, nodes, elapsed_ms, pn, dn, timed_out
+        返回字典字段：result, move, nodes, elapsed_ms, pn, dn, timed_out, tt_reused
         """
-        self.tt = {}
+        # 注意：self.tt 来自 __init__（若启用 reuse_tt，可能包含上一次求解的缓存）
         self.nodes = 0
         self.start_time = time.monotonic()
         timed_out = False
@@ -120,6 +178,21 @@ class DfpnSolver:
             else:
                 move_dict = {"x": best.x, "y": best.y, "certain": best.certain}
 
+        # 回写跨请求 TT 缓存
+        tt_final_size = len(self.tt)
+        if self.reuse_tt:
+            if tt_final_size > _TT_MAX_ENTRIES_PER_TABLE:
+                # 表过大 → 整张丢弃，避免无限增长
+                _TT_CACHE.pop(self._cache_key, None)
+            else:
+                _TT_CACHE[self._cache_key] = self.tt
+                # 表数量超上限 → 按插入顺序淘汰最旧的（dict 3.7+ 有序）
+                while len(_TT_CACHE) > _TT_MAX_TABLES:
+                    oldest = next(iter(_TT_CACHE))
+                    if oldest == self._cache_key:
+                        break
+                    del _TT_CACHE[oldest]
+
         return {
             "result": result,
             "move": move_dict,
@@ -128,6 +201,8 @@ class DfpnSolver:
             "pn": root_pn,
             "dn": root_dn,
             "timed_out": timed_out,
+            "tt_reused": self.tt_hits_at_start,
+            "tt_final_size": tt_final_size,
         }
 
     # ============================================================
