@@ -13,11 +13,14 @@ function createFullMask(size = BOARD_SIZE) {
   return m;
 }
 
-// 默认区域：x ∈ [0,3], y ∈ [3,7]（20 格，包含 y=3 便于 B 从上方紧气）
+// 默认区域：(0,3) 单点 + x∈[0,5] y∈[4,9] 矩形 = 37 格
 function createDefaultMask(size = BOARD_SIZE) {
   const m = createEmptyMask(size);
-  for (let x = 0; x <= 3; x++) {
-    for (let y = 3; y <= 7; y++) {
+  // 单点 (0,3)
+  m[3 * size + 0] = 1;
+  // 矩形 x∈[0,5] y∈[4,9]
+  for (let x = 0; x <= 5; x++) {
+    for (let y = 4; y <= 9; y++) {
       m[y * size + x] = 1;
     }
   }

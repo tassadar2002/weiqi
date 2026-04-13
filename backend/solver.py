@@ -351,8 +351,10 @@ class DfpnSolver:
 
             best_move, _ = kids[best_idx]
             handle = self._play_kid(best_move, turn)
-            self._mid(-turn, depth + 1, th_pn_child, th_dn_child)
-            self._undo_kid(handle)
+            try:
+                self._mid(-turn, depth + 1, th_pn_child, th_dn_child)
+            finally:
+                self._undo_kid(handle)
 
     def _aggregate_children(self, kids, turn: int, is_or: bool):
         """
@@ -427,12 +429,13 @@ class DfpnSolver:
             handle = self._play_kid(move, current_turn)
             if handle is None:
                 continue
-            child_pn, child_dn = self._tt_get(-current_turn)
-            if child_pn == 0 or child_dn == 0:
+            try:
+                child_pn, child_dn = self._tt_get(-current_turn)
+                if child_pn == 0 or child_dn == 0:
+                    continue
+                self._mid(-current_turn, depth=1, th_pn=DFPN_INF, th_dn=DFPN_INF)
+            finally:
                 self._undo_kid(handle)
-                continue
-            self._mid(-current_turn, depth=1, th_pn=DFPN_INF, th_dn=DFPN_INF)
-            self._undo_kid(handle)
 
     # ============================================================
     # 提取最佳着法（含 vitalness 破平 + 落败方顽抗）
