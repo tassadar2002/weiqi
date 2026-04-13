@@ -96,15 +96,29 @@ class Move:
 
 
 class DfpnSolver:
+    """
+    支持复合目标的 df-pn 求解器。
+
+    目标语义：
+      kill_targets:   攻方要杀掉的群的代表子坐标列表（通常是对方颜色）
+      defend_targets: 攻方要保住的群的代表子坐标列表（通常是己方颜色）
+      attacker 胜 = 所有 kill_targets 全部被提子
+      defender 胜 = 任一 kill_target 做出双眼 OR 任一 defend_target 被提子
+
+    兼容单目标：若只传 target_coord（旧接口），自动转为 kill_targets=[target_coord]。
+    """
+
     def __init__(self, board: Board, region_mask: List[int],
-                 target_coord: Tuple[int, int], attacker_color: int,
+                 target_coord: Optional[Tuple[int, int]] = None,
+                 attacker_color: int = 1,
+                 kill_targets: Optional[List[Tuple[int, int]]] = None,
+                 defend_targets: Optional[List[Tuple[int, int]]] = None,
                  max_nodes: int = 5_000_000,
                  max_time_ms: int = 60_000,
                  max_depth: int = 60,
                  reuse_tt: bool = True):
         self.board = board
         self.region_mask = region_mask
-        self.target_coord = target_coord
         self.attacker_color = attacker_color
         self.defender_color = -attacker_color
         self.max_nodes = max_nodes
@@ -112,10 +126,27 @@ class DfpnSolver:
         self.max_depth = max_depth
         self.reuse_tt = reuse_tt
 
-        # 跨请求 TT 缓存：相同 (region, target, attacker) 复用一张 TT
+        # 兼容旧接口：单 target_coord → 转为 kill_targets
+        if kill_targets is not None:
+            self.kill_targets: List[Tuple[int, int]] = list(kill_targets)
+        elif target_coord is not None:
+            self.kill_targets = [tuple(target_coord)]
+        else:
+            self.kill_targets = []
+        self.defend_targets: List[Tuple[int, int]] = list(defend_targets or [])
+
+        # 旧接口兼容字段
+        self.target_coord = self.kill_targets[0] if self.kill_targets else (
+            self.defend_targets[0] if self.defend_targets else (0, 0)
+        )
+
+        # TT 缓存 key 需包含所有目标
+        kill_key = tuple(sorted(self.kill_targets))
+        defend_key = tuple(sorted(self.defend_targets))
         self._cache_key = (
             _region_fingerprint(region_mask),
-            tuple(target_coord),
+            kill_key,
+            defend_key,
             int(attacker_color),
         )
         if reuse_tt:
@@ -125,13 +156,14 @@ class DfpnSolver:
 
         self.nodes = 0
         self.start_time = 0.0
-        self.tt_hits_at_start = len(self.tt)  # 统计：本次开始时 TT 已有多少条目
+        self.tt_hits_at_start = len(self.tt)
 
-        # 计算根目标的气集合，用于 vitalness（棋形要点破平）
-        root_target = get_target_group(board, target_coord)
-        self.root_target_libs: Set[int] = (
-            set(root_target["libs"]) if root_target else set()
-        )
+        # 计算所有杀目标群的气集合（union），用于 vitalness 棋形破平
+        self.root_target_libs: Set[int] = set()
+        for tc in self.kill_targets:
+            tgt = get_target_group(board, tc)
+            if tgt:
+                self.root_target_libs |= set(tgt["libs"])
 
     # ============================================================
     # 主入口
@@ -223,16 +255,37 @@ class DfpnSolver:
     # ============================================================
 
     def _terminal(self) -> Optional[str]:
-        """检查当前局面是否对目标群构成终止状态。"""
-        tx, ty = self.target_coord
-        if self.board.get(tx, ty) != self.defender_color:
-            return "ATK"  # 目标代表子已被提
-        target = get_target_group(self.board, self.target_coord)
-        if target is None:
+        """
+        检查复合终止条件：
+          攻方胜 (ATK) = 所有 kill_targets 被提子
+          防方胜 (DEF) = 任一 kill_target 做出双眼 OR 任一 defend_target 被提子
+        """
+        board = self.board
+
+        # 1. 防方胜条件：任一 defend_target 被提 → 攻方保护失败
+        for dx, dy in self.defend_targets:
+            if board.get(dx, dy) == EMPTY:
+                return "DEF"
+
+        # 2. 防方胜条件：任一 kill_target 做出双眼 → 攻方无法杀
+        all_killed = True
+        for kx, ky in self.kill_targets:
+            color = board.get(kx, ky)
+            if color == EMPTY:
+                continue  # 已被提，好
+            # 还活着 — 检查是否做出双眼
+            tgt = get_target_group(board, (kx, ky))
+            if tgt is None:
+                continue  # 无群 = 已提
+            eyes = count_real_eyes(board, tgt)
+            if eyes >= 2:
+                return "DEF"  # 这个杀目标活了，防方胜
+            all_killed = False  # 还没死也没活，继续
+
+        # 3. 攻方胜条件：所有 kill_targets 全部被提
+        if self.kill_targets and all_killed:
             return "ATK"
-        eyes = count_real_eyes(self.board, target)
-        if eyes >= 2:
-            return "DEF"
+
         return None
 
     # ============================================================

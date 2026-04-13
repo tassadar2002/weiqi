@@ -14,9 +14,12 @@ class BoardRenderer {
     this.showMask = false;
     this.regionMask = null;
     this.moveHistory = [];    // [{x, y, color: B|W, number}]
-    this.targetCoord = null;  // [x, y]：目标群代表子坐标
-    this.targetGroupCoords = null;  // 后端返回的目标群成员列表 [[x,y],...]
-    this.targetColor = null;  // 目标群颜色（用于校验仍存活）
+    this.targetCoord = null;  // [x, y]：单目标代表子（旧兼容）
+    this.targetGroupCoords = null;
+    this.targetColor = null;
+    // 多目标高亮
+    this.killGroups = [];     // [{coords: [[x,y],...], coord: [x,y]}, ...]
+    this.defendGroups = [];   // 同上
     this.resize();
   }
 
@@ -70,6 +73,7 @@ class BoardRenderer {
       this.drawRegionMask(ctx, this.regionMask);
     }
     this.drawStones(ctx, board);
+    this.drawMultiTargetHighlight(ctx, board);
     this.drawTargetHighlight(ctx, board);
     this.drawMoveNumbers(ctx, board);
 
@@ -88,8 +92,58 @@ class BoardRenderer {
     return false;
   }
 
-  // 高亮目标群：描红环 + 右上角三角标记
-  // 组成员由后端通过 targetGroupCoords 提供，避免前端再做规则计算
+  // 多目标高亮：杀目标红色，守目标蓝色
+  drawMultiTargetHighlight(ctx, board) {
+    const r = this.cellSize * 0.44;
+    ctx.save();
+    // 杀目标 = 红色
+    for (const g of this.killGroups) {
+      this._drawGroupRing(ctx, board, g.coords, g.coord, '#c73e3a', 'rgba(199, 62, 58, 0.30)', r);
+    }
+    // 守目标 = 蓝色
+    for (const g of this.defendGroups) {
+      this._drawGroupRing(ctx, board, g.coords, g.coord, '#3a6ec7', 'rgba(58, 110, 199, 0.30)', r);
+    }
+    ctx.restore();
+  }
+
+  _drawGroupRing(ctx, board, coords, repCoord, strokeColor, glowColor, r) {
+    if (!coords || coords.length === 0) return;
+    // 光晕 + 红/蓝环
+    for (const [x, y] of coords) {
+      if (board.get(x, y) === E) continue;
+      const [px, py] = this.boardToPixel(x, y);
+      const grad = ctx.createRadialGradient(px, py, r * 0.8, px, py, r * 1.5);
+      grad.addColorStop(0, glowColor);
+      grad.addColorStop(1, glowColor.replace(/[\d.]+\)$/, '0)'));
+      ctx.fillStyle = grad;
+      ctx.fillRect(px - r * 1.5, py - r * 1.5, r * 3, r * 3);
+      ctx.beginPath();
+      ctx.arc(px, py, r + 1.5, 0, Math.PI * 2);
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+    }
+    // 代表子三角标记
+    if (repCoord) {
+      const [rx, ry] = this.boardToPixel(repCoord[0], repCoord[1]);
+      const triSize = this.cellSize * 0.18;
+      const tx0 = rx + r * 0.85;
+      const ty0 = ry - r * 0.85;
+      ctx.beginPath();
+      ctx.moveTo(tx0, ty0 - triSize);
+      ctx.lineTo(tx0 + triSize * 0.9, ty0 + triSize * 0.6);
+      ctx.lineTo(tx0 - triSize * 0.9, ty0 + triSize * 0.6);
+      ctx.closePath();
+      ctx.fillStyle = strokeColor;
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  // 旧单目标高亮（若无多目标则用此）
   drawTargetHighlight(ctx, board) {
     if (!this.targetCoord) return;
     const group = this.targetGroupCoords;

@@ -5,13 +5,24 @@
 
 const API = {
 
-  // 落子（验证 + 应用）
-  async play(boardArr, lastCapture, x, y, color, targetCoord) {
+  // 落子（验证 + 应用）。支持多目标：传 killTargets / defendTargets 坐标列表
+  async play(boardArr, lastCapture, x, y, color, opts = {}) {
     return await postJson('/api/play', {
       board: boardArr,
       last_capture: lastCapture,
       x, y, color,
-      target_coord: targetCoord ? [targetCoord[0], targetCoord[1]] : null,
+      target_coord: opts.targetCoord || null,
+      kill_targets: opts.killTargets || [],
+      defend_targets: opts.defendTargets || [],
+    });
+  },
+
+  // 验证单个棋子是否可作为目标（不区分杀/守）
+  async validateTarget(boardArr, region, x, y) {
+    return await postJson('/api/validate_target', {
+      board: boardArr,
+      region,
+      x, y,
     });
   },
 

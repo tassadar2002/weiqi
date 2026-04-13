@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from board import Board
 from eyes import count_real_eyes, get_target_group
 from solver import DfpnSolver
-from target import make_target_from_stone
+from target import make_target_from_stone, validate_target_stone
 
 
 # 项目根 + 静态目录
@@ -51,7 +51,7 @@ def deserialize_board(grid: List[int], last_capture: int = -1) -> Board:
 
 def serialize_target_status(board: Board,
                             target_coord: Optional[List[int]]) -> Optional[dict]:
-    """根据当前棋盘 + 目标代表子坐标，返回目标群的实时状态。"""
+    """根据当前棋盘 + 单个目标代表子坐标，返回该群的实时状态。"""
     if target_coord is None:
         return None
     target = get_target_group(board, tuple(target_coord))
@@ -70,6 +70,35 @@ def serialize_target_status(board: Board,
         "group": [list(p) for p in target["group"]],
         "libs": target["lib_count"],
         "real_eyes": eyes,
+    }
+
+
+def serialize_multi_target_status(board: Board,
+                                  kill_coords: List[List[int]],
+                                  defend_coords: List[List[int]]) -> dict:
+    """返回所有杀目标 + 守目标的实时状态 + 复合终局判定。"""
+    kills = [serialize_target_status(board, c) for c in kill_coords]
+    defends = [serialize_target_status(board, c) for c in defend_coords]
+
+    all_killed = all(s and s["captured"] for s in kills) if kills else False
+    any_kill_alive = any(s and s["alive"] for s in kills)
+    any_defend_captured = any(s and s["captured"] for s in defends)
+
+    terminal = None
+    if any_defend_captured:
+        terminal = "DEFENDER_WINS"
+    elif any_kill_alive:
+        terminal = "DEFENDER_WINS"
+    elif all_killed:
+        terminal = "ATTACKER_WINS"
+
+    return {
+        "kill_statuses": kills,
+        "defend_statuses": defends,
+        "terminal": terminal,
+        "all_killed": all_killed,
+        "any_kill_alive": any_kill_alive,
+        "any_defend_captured": any_defend_captured,
     }
 
 
@@ -165,6 +194,8 @@ class WeiqiHandler(BaseHTTPRequestHandler):
                 self._handle_play(data)
             elif self.path == "/api/make_target":
                 self._handle_make_target(data)
+            elif self.path == "/api/validate_target":
+                self._handle_validate_target(data)
             elif self.path == "/api/inspect_target":
                 self._handle_inspect_target(data)
             elif self.path == "/api/legal_moves":
@@ -192,15 +223,21 @@ class WeiqiHandler(BaseHTTPRequestHandler):
                 "error": "非法落子（自杀或打劫禁着）",
             })
             return
-        target_coord = data.get("target_coord")
-        status = serialize_target_status(board, target_coord)
-        self._send_json(200, {
+        # 支持单目标（旧）和多目标（新）
+        kill_coords = data.get("kill_targets", [])
+        defend_coords = data.get("defend_targets", [])
+        single_coord = data.get("target_coord")
+        resp = {
             "ok": True,
             "new_board": board.grid,
             "last_capture": board.last_capture,
             "captured_count": len(u.captured),
-            "target_status": status,
-        })
+        }
+        if kill_coords or defend_coords:
+            resp["multi_status"] = serialize_multi_target_status(board, kill_coords, defend_coords)
+        if single_coord:
+            resp["target_status"] = serialize_target_status(board, single_coord)
+        self._send_json(200, resp)
 
     def _handle_make_target(self, data: dict) -> None:
         board = deserialize_board(data["board"], data.get("last_capture", -1))
@@ -211,6 +248,15 @@ class WeiqiHandler(BaseHTTPRequestHandler):
         # 附加 target_status 便于前端立即展示当前群
         if "error" not in result:
             result["target_status"] = serialize_target_status(board, result["target_coord"])
+        self._send_json(200, result)
+
+    def _handle_validate_target(self, data: dict) -> None:
+        """验证单个棋子是否可作为目标（不区分杀/守，由前端决定）。"""
+        board = deserialize_board(data["board"], data.get("last_capture", -1))
+        region = data["region"]
+        x = int(data["x"])
+        y = int(data["y"])
+        result = validate_target_stone(board, region, x, y)
         self._send_json(200, result)
 
     def _handle_inspect_target(self, data: dict) -> None:
@@ -230,22 +276,39 @@ class WeiqiHandler(BaseHTTPRequestHandler):
         board = deserialize_board(data["board"], data.get("last_capture", -1))
         region = data["region"]
         target = data["target"]
-        target_coord: Tuple[int, int] = tuple(target["target_coord"])
         attacker_color = int(target["attacker_color"])
         turn = int(data["turn"])
         max_time_ms = int(data.get("max_time_ms", 60_000))
         max_nodes = int(data.get("max_nodes", 5_000_000))
         max_depth = int(data.get("max_depth", 60))
 
+        # 解析多目标（新）或单目标（旧兼容）
+        kill_targets = [tuple(c) for c in target.get("kill_targets_coords", [])]
+        defend_targets = [tuple(c) for c in target.get("defend_targets_coords", [])]
+        # 旧接口兼容：若无多目标字段，从 target_coord 构造
+        if not kill_targets and not defend_targets and "target_coord" in target:
+            tc = tuple(target["target_coord"])
+            # 旧语义：target_coord 指向防方群 = 攻方要杀
+            kill_targets = [tc]
+
         solver = DfpnSolver(
-            board, region, target_coord, attacker_color,
+            board, region,
+            attacker_color=attacker_color,
+            kill_targets=kill_targets,
+            defend_targets=defend_targets,
             max_nodes=max_nodes,
             max_time_ms=max_time_ms,
             max_depth=max_depth,
         )
         result = solver.solve(turn)
-        # 求解后局面未变，但顺便附上当前 target_status
-        result["target_status"] = serialize_target_status(board, list(target_coord))
+
+        # 附多目标实时状态
+        kill_coords = [list(c) for c in kill_targets]
+        defend_coords = [list(c) for c in defend_targets]
+        result["multi_status"] = serialize_multi_target_status(board, kill_coords, defend_coords)
+        # 兼容旧接口
+        if kill_targets:
+            result["target_status"] = serialize_target_status(board, list(kill_targets[0]))
         self._send_json(200, result)
 
 

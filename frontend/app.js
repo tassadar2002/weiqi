@@ -32,6 +32,9 @@ class App {
     this.moveHistory = [];
     this.moveCounter = 0;
     this.decisionLog = [];
+    // 多目标
+    this.killTargets = [];    // [{coord, color, group, libs, stones, eyes}, ...]
+    this.defendTargets = [];  // 同上
 
     this.loadInitialSetup();
     this.bindEvents();
@@ -99,6 +102,7 @@ class App {
     document.getElementById('btn-reset').addEventListener('click', () => this.enterLayoutMode());
     document.getElementById('btn-autoplay').addEventListener('click', () => this.toggleAutoplay());
     document.getElementById('btn-pick-target').addEventListener('click', () => this.enterPickTargetMode());
+    document.getElementById('btn-confirm-target').addEventListener('click', () => this.confirmMultiTarget());
 
     window.addEventListener('resize', () => {
       this.renderer.resize();
@@ -152,9 +156,13 @@ class App {
       this.initialSnapshot = null;
     }
     this.targetInfo = null;
+    this.killTargets = [];
+    this.defendTargets = [];
     this.renderer.targetCoord = null;
     this.renderer.targetGroupCoords = null;
     this.renderer.targetColor = null;
+    this.renderer.killGroups = [];
+    this.renderer.defendGroups = [];
 
     document.getElementById('layout-controls').classList.remove('hidden');
     document.getElementById('region-controls').classList.add('hidden');
@@ -235,19 +243,20 @@ class App {
   }
 
   logTargetDecision() {
-    const t = this.targetInfo;
-    if (!t) return;
-    const defStr = t.defender_color === B ? '黑' : '白';
-    const atkStr = t.attacker_color === B ? '黑' : '白';
-    const [tx, ty] = t.target_coord;
-    const mark = t.user_picked
-      ? ' <span class="cand" style="background:rgba(91,140,111,0.2)">用户指定</span>'
-      : '';
+    if (this.killTargets.length === 0 && this.defendTargets.length === 0) return;
+
+    const killDesc = this.killTargets.map(t =>
+      `<span class="cand" style="border-color:#c73e3a;">杀 (${t.coord[0]},${t.coord[1]}) ${t.stones}子/${t.libs}气</span>`
+    ).join('');
+    const defDesc = this.defendTargets.map(t =>
+      `<span class="cand" style="border-color:#3a6ec7;">守 (${t.coord[0]},${t.coord[1]}) ${t.stones}子/${t.libs}气</span>`
+    ).join('');
+
     this.logEntry({
       type: 'target',
-      main: `选定目标：${defStr}@(${tx},${ty})`,
-      meta: `${t.target_stones} 子 · ${t.target_libs} 气 · ${t.target_eyes} 眼`,
-      sub: `防方 ${defStr} · 攻方 ${atkStr}${mark}`,
+      main: `设定复合目标`,
+      meta: `杀目标 ${this.killTargets.length} 个 · 守目标 ${this.defendTargets.length} 个`,
+      sub: (killDesc || '') + (defDesc || ''),
     });
   }
 
@@ -355,21 +364,28 @@ class App {
   }
 
   updateTargetLabel() {
-    const t = this.targetInfo;
     const el = document.getElementById('classify-label');
     const regionTotal = maskCellCount(this.regionMask);
     const empty = this.countRegionEmpty();
     const statsLine = `<div style="margin-top:0.25rem;font-weight:400;color:var(--ink-medium);font-size:0.78rem;">` +
       `区域 ${regionTotal} 格 · 空位 ${empty}</div>`;
-    if (!t) {
+
+    const nk = this.killTargets.length;
+    const nd = this.defendTargets.length;
+    if (nk === 0 && nd === 0) {
       el.innerHTML = `<div style="color:var(--vermillion);">未选目标（请点选棋子）</div>` + statsLine;
       return;
     }
-    const defStr = t.defender_color === B ? '黑' : '白';
-    const atkStr = t.attacker_color === B ? '黑' : '白';
-    const [tx, ty] = t.target_coord;
-    el.innerHTML =
-      `<div>目标：${defStr}@(${tx},${ty}) ${t.target_stones}子/${t.target_libs}气 · 攻方：${atkStr}</div>` + statsLine;
+    const parts = [];
+    if (nk > 0) {
+      const coords = this.killTargets.map(t => `(${t.coord[0]},${t.coord[1]})`).join(' ');
+      parts.push(`<span style="color:#c73e3a;">杀${nk}群 ${coords}</span>`);
+    }
+    if (nd > 0) {
+      const coords = this.defendTargets.map(t => `(${t.coord[0]},${t.coord[1]})`).join(' ');
+      parts.push(`<span style="color:#3a6ec7;">守${nd}群 ${coords}</span>`);
+    }
+    el.innerHTML = `<div>${parts.join(' · ')}</div>` + statsLine;
   }
 
   displaySolveMeta(r) {
@@ -450,7 +466,11 @@ class App {
         this.board.toArray(),
         this.board.lastCapture,
         bx, by, B,
-        this.targetInfo.target_coord,
+        {
+          targetCoord: this.targetInfo ? this.targetInfo.target_coord : null,
+          killTargets: this.killTargets.map(t => t.coord),
+          defendTargets: this.defendTargets.map(t => t.coord),
+        },
       );
     } catch (err) {
       this.waitingForAI = false;
@@ -486,15 +506,52 @@ class App {
     this.board.replaceFromArray(r.new_board, r.last_capture);
     this.recordMove(x, y, color);
     this.renderer.lastMove = [x, y, color === B ? 'black' : 'white'];
-    if (r.target_status) {
+    // 更新多目标高亮
+    if (r.multi_status) {
+      this._updateMultiHighlightFromStatus(r.multi_status);
+    } else if (r.target_status) {
       this.renderer.targetGroupCoords = r.target_status.group;
     }
     this.hideFeedback();
     this.renderBoard();
   }
 
-  // 由 r.target_status 判断是否到达棋盘终局；返回 true 表示终局已处理
+  _updateMultiHighlightFromStatus(ms) {
+    // 用后端返回的最新群坐标更新渲染
+    if (ms.kill_statuses) {
+      for (let i = 0; i < this.killTargets.length && i < ms.kill_statuses.length; i++) {
+        const s = ms.kill_statuses[i];
+        if (s && s.group) this.killTargets[i].group = s.group;
+      }
+    }
+    if (ms.defend_statuses) {
+      for (let i = 0; i < this.defendTargets.length && i < ms.defend_statuses.length; i++) {
+        const s = ms.defend_statuses[i];
+        if (s && s.group) this.defendTargets[i].group = s.group;
+      }
+    }
+    this.syncMultiTargetHighlight();
+  }
+
+  // 由 multi_status 或 target_status 判断是否到达棋盘终局
   checkPostMoveTerminal(r) {
+    // 优先使用多目标状态
+    if (r.multi_status) {
+      if (r.multi_status.terminal === 'ATTACKER_WINS') {
+        this.showTerminal('TARGET_CAPTURED');
+        return true;
+      }
+      if (r.multi_status.terminal === 'DEFENDER_WINS') {
+        if (r.multi_status.any_defend_captured) {
+          this.showTerminal('DEFEND_LOST');
+        } else {
+          this.showTerminal('TARGET_ALIVE');
+        }
+        return true;
+      }
+      return false;
+    }
+    // 旧单目标兼容
     if (!r.target_status) return false;
     if (r.target_status.captured) {
       this.showTerminal('TARGET_CAPTURED');
@@ -561,7 +618,11 @@ class App {
         this.board.toArray(),
         this.board.lastCapture,
         r.move.x, r.move.y, color,
-        this.targetInfo.target_coord,
+        {
+          targetCoord: this.targetInfo ? this.targetInfo.target_coord : null,
+          killTargets: this.killTargets.map(t => t.coord),
+          defendTargets: this.defendTargets.map(t => t.coord),
+        },
       );
     } catch (err) {
       this.waitingForAI = false;
@@ -588,7 +649,7 @@ class App {
   }
 
   // ============================================================
-  // 手动选目标
+  // 多目标选择（点白子=杀目标，点黑子=守目标，再点取消）
   // ============================================================
 
   enterPickTargetMode() {
@@ -596,28 +657,74 @@ class App {
     if (this.autoplayTimer) this.stopAutoplay();
     if (this.waitingForAI) return;
     this.mode = 'pick-target';
+    // 不清空已选——允许追加/删除
     this.canvas.style.cursor = 'crosshair';
-    document.getElementById('move-text').textContent = '点击任意棋子设为目标';
+    document.getElementById('btn-confirm-target').classList.remove('hidden');
+    document.getElementById('move-text').textContent = '点击棋子设定目标';
     this.showFeedback('correct',
-      '请点击你想作为目标的棋子（黑子=黑方防守，白子=白方防守）。点击空点取消。');
+      '点白子 → 标为杀目标(红)；点黑子 → 标为守目标(蓝)；再点已选的 → 取消。点空点结束。');
+    this.syncMultiTargetHighlight();
+    this.renderBoard();
   }
 
   exitPickTargetMode() {
     this.mode = 'solve';
     this.canvas.style.cursor = '';
+    document.getElementById('btn-confirm-target').classList.add('hidden');
     this.hideFeedback();
-    document.getElementById('move-text').textContent = this.targetInfo ? '轮到黑棋' : '未选目标';
+    const hasTarget = this.killTargets.length > 0 || this.defendTargets.length > 0;
+    document.getElementById('move-text').textContent = hasTarget ? '轮到黑棋' : '未选目标';
+  }
+
+  // 同步 renderer 的多目标高亮
+  syncMultiTargetHighlight() {
+    this.renderer.killGroups = this.killTargets.map(t => ({ coords: t.group, coord: t.coord }));
+    this.renderer.defendGroups = this.defendTargets.map(t => ({ coords: t.group, coord: t.coord }));
+    // 清除旧的单目标高亮
+    this.renderer.targetCoord = null;
+    this.renderer.targetGroupCoords = null;
+  }
+
+  // 判断坐标是否已在某个目标列表中（按群判断，不重复添加同群的不同子）
+  _findTargetIndex(list, bx, by) {
+    for (let i = 0; i < list.length; i++) {
+      for (const [gx, gy] of list[i].group) {
+        if (gx === bx && gy === by) return i;
+      }
+    }
+    return -1;
   }
 
   async onPickTargetClick(bx, by) {
     const stone = this.board.get(bx, by);
     if (stone === E) {
+      // 点空点 → 退出选择模式
       this.exitPickTargetMode();
       return;
     }
-    let result;
+
+    // 检查是否已在某个目标列表中 → 取消
+    const ki = this._findTargetIndex(this.killTargets, bx, by);
+    if (ki >= 0) {
+      this.killTargets.splice(ki, 1);
+      this.syncMultiTargetHighlight();
+      this.updateTargetLabel();
+      this.renderBoard();
+      return;
+    }
+    const di = this._findTargetIndex(this.defendTargets, bx, by);
+    if (di >= 0) {
+      this.defendTargets.splice(di, 1);
+      this.syncMultiTargetHighlight();
+      this.updateTargetLabel();
+      this.renderBoard();
+      return;
+    }
+
+    // 新增：向后端验证
+    let info;
     try {
-      result = await API.makeTarget(
+      info = await API.validateTarget(
         this.board.toArray(),
         Array.from(this.regionMask),
         bx, by,
@@ -626,28 +733,53 @@ class App {
       this.showFeedback('incorrect', '后端通信失败：' + err.message);
       return;
     }
-    if (result.error) {
-      this.showFeedback('incorrect', result.error);
+    if (info.error) {
+      this.showFeedback('incorrect', info.error);
       return;
     }
 
-    // 切换目标 → 恢复初始局面（避免历史走法和新目标矛盾）
+    // 按颜色分配：白子→杀目标，黑子→守目标
+    if (info.color === W) {
+      this.killTargets.push(info);
+    } else {
+      this.defendTargets.push(info);
+    }
+    this.syncMultiTargetHighlight();
+    this.updateTargetLabel();
+    this.renderBoard();
+
+    const role = info.color === W ? '杀目标(红)' : '守目标(蓝)';
+    this.showFeedback('correct',
+      `已添加 ${role}：(${bx},${by}) ${info.stones}子/${info.libs}气。继续点击或点空点结束。`);
+  }
+
+  // "确认目标" 按钮
+  confirmMultiTarget() {
+    if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
+      this.showFeedback('incorrect', '至少需要指定一个目标。');
+      return;
+    }
+    // 构造复合 targetInfo（供 solve 使用）
+    this.targetInfo = {
+      attacker_color: B,  // 黑棋是攻方
+      kill_targets_coords: this.killTargets.map(t => t.coord),
+      defend_targets_coords: this.defendTargets.map(t => t.coord),
+      // 旧接口兼容
+      target_coord: this.killTargets.length > 0 ? this.killTargets[0].coord : (
+        this.defendTargets.length > 0 ? this.defendTargets[0].coord : null
+      ),
+    };
+
+    // 恢复初始局面
     if (this.initialSnapshot) {
       this.board.replaceFromArray(this.initialSnapshot.boardArr, -1);
       this.regionMask = cloneMask(this.initialSnapshot.regionMask);
     }
-    this.targetInfo = result;
-    this.renderer.targetCoord = result.target_coord;
-    this.renderer.targetColor = result.defender_color;
-    this.renderer.targetGroupCoords = result.target_status
-      ? result.target_status.group
-      : (result.group || []);
     this.moveHistory = [];
     this.moveCounter = 0;
     this.renderer.moveHistory = this.moveHistory;
     this.renderer.lastMove = null;
     this.autoplayColor = B;
-
     this.initialSnapshot = {
       boardArr: this.board.toArray(),
       regionMask: cloneMask(this.regionMask),
@@ -656,6 +788,7 @@ class App {
     this.updateTargetLabel();
     this.decisionLog = [];
     this.logTargetDecision();
+    this.syncMultiTargetHighlight();
     this.renderBoard();
     this.exitPickTargetMode();
   }
@@ -675,8 +808,12 @@ class App {
   startAutoplay() {
     if (this.mode !== 'solve') return;
     if (this.waitingForAI) return;
+    if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
+      this.showFeedback('incorrect', '请先设定目标棋子。');
+      return;
+    }
     if (!this.targetInfo) {
-      this.showFeedback('incorrect', '请先点选目标棋子。');
+      this.showFeedback('incorrect', '请先点击"确认目标"。');
       return;
     }
     document.getElementById('btn-autoplay').textContent = '停止自动';
@@ -714,9 +851,11 @@ class App {
 
   showTerminal(type) {
     if (type === 'TARGET_CAPTURED') {
-      this.showFeedback('correct', '目标已被提子，攻方胜。');
+      this.showFeedback('correct', '所有杀目标已被提子，攻方胜！');
     } else if (type === 'TARGET_ALIVE') {
-      this.showFeedback('incorrect', '目标已做活（2 真眼），防方胜。');
+      this.showFeedback('incorrect', '杀目标做活（2 真眼），防方胜。');
+    } else if (type === 'DEFEND_LOST') {
+      this.showFeedback('incorrect', '守目标被提子，攻方保护失败，防方胜。');
     }
     this.logTerminal(type);
     document.getElementById('move-text').textContent = '对局结束';
