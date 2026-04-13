@@ -303,14 +303,47 @@ class DfpnSolver:
     def _gen_children(self, turn: int, allow_pass: bool
                       ) -> List[Tuple[Optional[Tuple[int, int]], int]]:
         """
-        生成所有合法子节点，按 vitalness 降序排序。
-        每项是 (move_or_None, vitalness)；move=None 表示 pass。
+        生成所有合法子节点，按复合分数降序排序。
+        评分 = 提子加分 + vitalness + 邻石加分。
+        提子数来自 play_undoable（零额外开销）。不做叫吃检测（group_and_libs 太贵）。
         """
-        moves = self.board.legal_moves_in_region(turn, self.region_mask)
-        kids: List[Tuple[Optional[Tuple[int, int]], int]] = [
-            ((x, y), self._vitalness(x, y)) for x, y in moves
-        ]
-        kids.sort(key=lambda k: -k[1])  # vitalness 降序
+        board = self.board
+        size = board.size
+        grid = board.grid
+        region = self.region_mask
+        root_libs = self.root_target_libs
+        kids: List[Tuple[Optional[Tuple[int, int]], int]] = []
+
+        for y in range(size):
+            for x in range(size):
+                idx = y * size + x
+                if not region[idx]:
+                    continue
+                if grid[idx] != EMPTY:
+                    continue
+                u = board.play_undoable(x, y, turn)
+                if u is None:
+                    continue
+
+                score = 0
+                # 提子 = 极高分（play_undoable 已经算好了）
+                cap = len(u.captured)
+                if cap > 0:
+                    score += 10000 + cap * 1000
+
+                # vitalness（邻点中属于根杀目标气的数量）
+                for nx, ny in board.neighbors(x, y):
+                    ni = ny * size + nx
+                    if ni in root_libs:
+                        score += 100
+                    # 邻近棋子 = 有关手
+                    if grid[ni] != EMPTY:
+                        score += 5
+
+                board.undo(u)
+                kids.append(((x, y), score))
+
+        kids.sort(key=lambda k: -k[1])
         if allow_pass:
             kids.append((None, -1))
         return kids

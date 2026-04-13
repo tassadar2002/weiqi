@@ -10,8 +10,8 @@
 // ============================================================
 
 const SOLVE_OPTIONS = {
-  maxTimeMs: 120000,
-  maxNodes: 10000000,
+  maxTimeMs: 300000,   // 5 分钟（大区域 + 多目标需要更多时间）
+  maxNodes: 50000000,  // 5000 万节点
   maxDepth: 60,
 };
 
@@ -367,8 +367,14 @@ class App {
     const el = document.getElementById('classify-label');
     const regionTotal = maskCellCount(this.regionMask);
     const empty = this.countRegionEmpty();
+    let difficultyHint = '';
+    if (empty > 15) {
+      difficultyHint = `<span style="color:var(--vermillion);font-weight:700;">（空位过多，大概率 UNPROVEN。建议缩小区域至 ≤12 空位）</span>`;
+    } else if (empty > 10) {
+      difficultyHint = `<span style="color:var(--gold);">（空位较多，可能需要较长时间）</span>`;
+    }
     const statsLine = `<div style="margin-top:0.25rem;font-weight:400;color:var(--ink-medium);font-size:0.78rem;">` +
-      `区域 ${regionTotal} 格 · 空位 ${empty}</div>`;
+      `区域 ${regionTotal} 格 · 空位 ${empty} ${difficultyHint}</div>`;
 
     const nk = this.killTargets.length;
     const nd = this.defendTargets.length;
@@ -588,16 +594,27 @@ class App {
     this.displaySolveMeta(r);
 
     if (!r.move) {
+      // UNPROVEN 无着 → 显示信息但不停自动对弈（让用户看到原因）
+      if (r.result === 'UNPROVEN') {
+        const reason = r.timed_out ? '超时' : '节点上限';
+        const pnStr = r.pn >= 1e9 ? '∞' : r.pn;
+        const dnStr = r.dn >= 1e9 ? '∞' : r.dn;
+        this.showFeedback('incorrect',
+          `未能证明（${reason}）· ${r.nodes.toLocaleString()} 节点 / ${(r.elapsed_ms/1000).toFixed(1)}s` +
+          ` · pn=${pnStr} dn=${dnStr}。建议缩小区域（空位 ≤12）。`);
+      }
       this.waitingForAI = false;
       this.stopAutoplay();
-      if (color === this.targetInfo.attacker_color) {
-        this.showFeedback('incorrect', '攻方无合法着法，防方胜。');
-        this.logTerminal('ATK_NO_MOVE');
-      } else {
-        this.showFeedback('correct', '防方无合法着法，攻方胜。');
-        this.logTerminal('DEF_NO_MOVE');
+      if (r.result !== 'UNPROVEN') {
+        if (color === this.targetInfo.attacker_color) {
+          this.showFeedback('incorrect', '攻方无合法着法，防方胜。');
+          this.logTerminal('ATK_NO_MOVE');
+        } else {
+          this.showFeedback('correct', '防方无合法着法，攻方胜。');
+          this.logTerminal('DEF_NO_MOVE');
+        }
       }
-      document.getElementById('move-text').textContent = '对局结束';
+      document.getElementById('move-text').textContent = r.result === 'UNPROVEN' ? '未证明（无着可选）' : '对局结束';
       return;
     }
 
