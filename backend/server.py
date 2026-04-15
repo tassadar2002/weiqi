@@ -59,6 +59,7 @@ def _board_from(data: dict) -> Board:
     b = Board(BOARD_SIZE)
     b.grid = list(data["board"])
     b.last_capture = int(data.get("last_capture", -1))
+    b.rebuild_zh()
     return b
 
 

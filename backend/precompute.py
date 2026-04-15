@@ -10,6 +10,7 @@ import json
 import multiprocessing as mp
 import os
 import sqlite3
+import struct
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -26,7 +27,7 @@ def _init_db(db_path: str) -> sqlite3.Connection:
     db = sqlite3.connect(db_path)
     _exec(db, "PRAGMA journal_mode=WAL")
     _exec(db, "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
-    _exec(db, "CREATE TABLE IF NOT EXISTS tt (key TEXT PRIMARY KEY, pn INTEGER, dn INTEGER)")
+    _exec(db, "CREATE TABLE IF NOT EXISTS tt (key BLOB PRIMARY KEY, pn INTEGER, dn INTEGER)")
     db.commit()
     return db
 
@@ -50,6 +51,19 @@ def _get_meta(db: sqlite3.Connection, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def _pack_key(key: tuple) -> bytes:
+    """TT key (zh, turn, lc) → 10 字节 BLOB。
+    zh: uint64 (8B), turn: int8 (1B), lc: int16 用 uint8 编码 (1B, -1→255)。"""
+    zh, turn, lc = key
+    return struct.pack(">QbB", zh, turn, lc if lc >= 0 else 255)
+
+
+def _unpack_key(blob: bytes) -> tuple:
+    """10 字节 BLOB → (zh, turn, lc) tuple。"""
+    zh, turn, lc_u8 = struct.unpack(">QbB", blob)
+    return (zh, turn, -1 if lc_u8 == 255 else lc_u8)
+
+
 def _flush_tt_from_log(db: sqlite3.Connection, solver, already_flushed: int) -> None:
     """增量写入：只写 tt_log 中 index >= already_flushed 的新条目。O(新增量)。"""
     new_keys = solver.tt_log[already_flushed:]
@@ -57,29 +71,20 @@ def _flush_tt_from_log(db: sqlite3.Connection, solver, already_flushed: int) -> 
         tt = solver.tt
         cur = db.cursor()
         cur.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)",
-                        [(_tt_key_to_str(k), tt[k][0], tt[k][1]) for k in new_keys])
+                        [(_pack_key(k), tt[k][0], tt[k][1]) for k in new_keys])
         cur.close()
 
 
-def _tt_key_to_str(key) -> str:
-    """TT key (tuple or str) → SQLite 存储字符串。"""
-    if isinstance(key, tuple):
-        return f"{key[0]}|{key[1]}|{key[2]}"
-    return key
-
-
 def load_tt_from_sqlite(db_path: str) -> Dict:
-    """从 SQLite 加载全部 TT 到内存 dict。key 为 "zh|turn|lc" 字符串。"""
+    """从 SQLite 加载全部 TT 到内存 dict。"""
     db = sqlite3.connect(db_path)
     cur = db.cursor()
     rows = cur.execute("SELECT key, pn, dn FROM tt").fetchall()
     cur.close()
     db.close()
-    # 转为 tuple key 以匹配 solver 的 _tt_key 格式
     tt = {}
-    for key_str, pn, dn in rows:
-        parts = key_str.split("|")
-        tt[(int(parts[0]), int(parts[1]), int(parts[2]))] = (pn, dn)
+    for key_blob, pn, dn in rows:
+        tt[_unpack_key(key_blob)] = (pn, dn)
     return tt
 
 
@@ -162,6 +167,7 @@ def _worker_solve(board_grid: List[int], last_capture: int,
     board = Board(BOARD_SIZE)
     board.grid = list(board_grid)
     board.last_capture = last_capture
+    board.rebuild_zh()
 
     db = _init_db(db_path)
     _exec(db, "CREATE TABLE IF NOT EXISTS results "
@@ -332,6 +338,7 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     board = Board(BOARD_SIZE)
     board.grid = list(board_grid)
     board.last_capture = last_capture
+    board.rebuild_zh()
 
     # 生成根候选
     tmp_solver = DfpnSolver(

@@ -46,6 +46,13 @@ class Board:
         for i in range(size * size):
             self.zh ^= ZOBRIST[i][1]
 
+    def rebuild_zh(self) -> None:
+        """从 grid 重算 Zobrist hash。在直接修改 grid 后调用。"""
+        zh = 0
+        for i, g in enumerate(self.grid):
+            zh ^= ZOBRIST[i][g + 1]
+        self.zh = zh
+
     def clone(self) -> "Board":
         b = Board(self.size)
         b.grid = list(self.grid)
