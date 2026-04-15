@@ -108,50 +108,32 @@ def cli_status(problem_id: str):
 
     if prog:
         elapsed = prog.get("elapsed_ms", 0)
+        done = prog.get("done_moves", 0)
+        total = prog.get("total_moves", 0)
+        if total:
+            print(f"根着进度: {done}/{total} 已证明")
         print(f"搜索节点: {prog.get('total_nodes', 0):,}")
-        tt = prog.get("total_tt", 0)
-        if tt:
-            print(f"TT 缓存: {tt:,} 条")
         nps = prog.get("nodes_per_sec", 0)
         if nps:
             print(f"速度: {nps:,} nodes/s")
         if elapsed > 0:
             print(f"用时: {_fmt_duration(int(elapsed))}")
         wa = prog.get("workers_active")
-        wt = prog.get("workers_total")
-        if wa is not None and wt is not None:
-            print(f"进程: {wa}/{wt} 活跃")
-        total_retries = prog.get("total_retries", 0)
-        if total_retries > 0:
-            print(f"重启: 共 {total_retries} 次（断点续传）")
+        if wa is not None:
+            print(f"活跃进程: {wa}")
 
     # ---- worker 明细 ----
-    # 优先从主 progress.json 的 workers 快照读取（任务已完成时 worker 文件已清理）
-    worker_data = (prog or {}).get("workers")
-    if worker_data:
-        _print_worker_table(worker_data)
-        return
-
-    # 任务运行中：扫描 worker progress 文件
-    pattern = os.path.join(_CACHE_DIR, f"{job_id}_w*_progress.json")
+    # 扫描 worker progress 文件
+    pattern = os.path.join(_CACHE_DIR, f"{job_id}_worker*_progress.json")
     wpaths = sorted(_glob.glob(pattern))
     if not wpaths:
         return
-
-    # 读 pids.json 获取每个 worker 的 pid
-    pids = []
-    pids_path = os.path.join(_CACHE_DIR, f"{job_id}_pids.json")
-    try:
-        with open(pids_path) as f:
-            pids = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
 
     live_workers = []
     for wp in wpaths:
         base = os.path.basename(wp)
         try:
-            wi = int(base.split("_w")[1].split("_")[0])
+            wi = int(base.replace(f"{job_id}_worker", "").replace("_progress.json", ""))
         except (IndexError, ValueError):
             continue
         try:
@@ -159,19 +141,16 @@ def cli_status(problem_id: str):
                 wd = json.load(f)
         except (json.JSONDecodeError, OSError):
             wd = {}
-        wbin = os.path.join(_CACHE_DIR, f"{job_id}_w{wi}.bin")
-        pid = pids[wi] if wi < len(pids) else None
+        pid = wd.get("pid")
         snap = {
             "worker": wi,
             "pid": pid,
             "status": wd.get("status", "unknown"),
-            "total_nodes": wd.get("total_nodes", wd.get("nodes", 0)),
-            "tt_size": wd.get("tt_size", wd.get("tt_flushed", 0)),
+            "total_nodes": wd.get("total_nodes", 0),
+            "tasks_done": wd.get("tasks_done", 0),
             "elapsed_ms": wd.get("elapsed_ms", 0),
             "current_move": wd.get("current_move"),
-            "error": wd.get("error"),
         }
-        # 检查进程是否还活着
         if pid is not None and wd.get("status") not in ("done", "crashed"):
             try:
                 os.kill(pid, 0)
@@ -179,10 +158,6 @@ def cli_status(problem_id: str):
                 snap["status"] = "异常退出"
             except PermissionError:
                 pass
-        if os.path.exists(wbin):
-            whdr = _read_header(wbin)
-            if whdr:
-                snap["bin_count"] = whdr["count"]
         live_workers.append(snap)
     if live_workers:
         _print_worker_table(live_workers)
@@ -284,41 +259,30 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
 def _print_worker_table(workers: list):
     """打印 worker 明细表。"""
     _STATUS_LABEL = {
-        "done": "完成", "running": "运行中", "merging": "合并中",
+        "done": "完成", "running": "运行中",
         "crashed": "异常退出", "unknown": "未知",
     }
     print()
     print("Worker 明细:")
-    fmt = "  {:<4s}  {:<8s}  {:>7s}  {:>5s}  {:>12s}  {:>10s}  {:>8s}  {}"
-    print(fmt.format("#", "状态", "PID", "Exit", "节点", "TT", "用时", "备注"))
-    print("  " + "-" * 76)
+    fmt = "  {:<4s}  {:<8s}  {:>7s}  {:>12s}  {:>6s}  {:>8s}  {}"
+    print(fmt.format("#", "状态", "PID", "节点", "任务数", "用时", "备注"))
+    print("  " + "-" * 64)
     for w in sorted(workers, key=lambda x: x.get("worker", 0)):
         wi = w.get("worker", "?")
         st = _STATUS_LABEL.get(w.get("status", ""), w.get("status", "?"))
         nodes = w.get("total_nodes", 0)
-        tt = w.get("tt_size", 0) or w.get("bin_count", 0)
+        tasks = w.get("tasks_done", 0)
         elapsed = w.get("elapsed_ms", 0)
         pid = w.get("pid")
         pid_str = str(pid) if pid is not None else "-"
-        ec = w.get("exitcode")
-        ec_str = str(ec) if ec is not None else "-"
         notes = []
-        retries = w.get("retries", 0)
-        if retries > 0:
-            notes.append(f"重启{retries}次")
-        err = w.get("error")
-        if err:
-            notes.append(err)
         cm = w.get("current_move")
         if cm and w.get("status") == "running":
             notes.append(f"当前={cm}")
-        moves = w.get("moves")
-        if moves:
-            notes.append(f"{len(moves)}着")
         note_str = "  ".join(notes)
         print(fmt.format(
-            str(wi), st, pid_str, ec_str,
-            f"{nodes:,}", f"{tt:,}",
+            str(wi), st, pid_str,
+            f"{nodes:,}", str(tasks),
             _fmt_duration(int(elapsed)) if elapsed else "-",
             note_str,
         ))
@@ -347,16 +311,15 @@ def _progress_printer(progress_path: str, stop_event):
         if nodes == last_nodes:
             continue
         last_nodes = nodes
-        tt = prog.get("total_tt", 0)
         nps = prog.get("nodes_per_sec", 0)
         elapsed = prog.get("elapsed_ms", 0)
+        done = prog.get("done_moves", 0)
+        total = prog.get("total_moves", "?")
         wa = prog.get("workers_active", "?")
-        wt = prog.get("workers_total", "?")
-        st = prog.get("status", "")
-        label = "合并中" if st == "merging" else "计算中"
-        line = (f"\r  {label} {_fmt_duration(elapsed)}  "
-                f"节点={nodes:>12,}  TT={tt:>10,}  "
-                f"{nps:>8,} n/s  进程 {wa}/{wt}  ")
+        line = (f"\r  计算中 {_fmt_duration(elapsed)}  "
+                f"根着 {done}/{total}  "
+                f"节点={nodes:>12,}  "
+                f"{nps:>8,} n/s  进程 {wa}  ")
         sys.stdout.write(line)
         sys.stdout.flush()
 
@@ -396,7 +359,7 @@ if __name__ == "__main__":
     p_run = sub.add_parser("run", help="对指定题目运行预处理")
     p_run.add_argument("problem_id", help="题目 ID")
     p_run.add_argument("-w", "--workers", type=int, default=None,
-                       help="worker 进程数（默认 CPU-1）")
+                       help="worker 进程数（默认 CPU×70%%）")
 
     args, unknown = parser.parse_known_args()
 
