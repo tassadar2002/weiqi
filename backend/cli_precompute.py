@@ -121,10 +121,9 @@ def cli_status(problem_id: str):
         wt = prog.get("workers_total")
         if wa is not None and wt is not None:
             print(f"进程: {wa}/{wt} 活跃")
-        n_crashed = prog.get("crashed_workers", 0)
-        n_total_w = prog.get("total_workers", 0)
-        if n_crashed > 0:
-            print(f"警告: {n_crashed}/{n_total_w} 个 worker 异常退出")
+        total_retries = prog.get("total_retries", 0)
+        if total_retries > 0:
+            print(f"重启: 共 {total_retries} 次（断点续传）")
 
     # ---- worker 明细 ----
     # 优先从主 progress.json 的 workers 快照读取（任务已完成时 worker 文件已清理）
@@ -242,15 +241,14 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
         sys.stdout.write("\r" + " " * 80 + "\r")  # 清行
         # 读取最终进度
         elapsed_str = ""
-        crashed_info = ""
+        retry_info = ""
         try:
             with open(progress_path) as f:
                 final_prog = json.load(f)
             elapsed_str = f"  用时 {_fmt_duration(final_prog.get('elapsed_ms', 0))}"
-            n_crashed = final_prog.get("crashed_workers", 0)
-            n_total = final_prog.get("total_workers", 0)
-            if n_crashed > 0:
-                crashed_info = f"\n警告: {n_crashed}/{n_total} 个 worker 异常退出，结果可能不完整"
+            total_retries = final_prog.get("total_retries", 0)
+            if total_retries > 0:
+                retry_info = f"\n提示: 过程中共重启 worker {total_retries} 次（断点续传）"
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
         # 读取结果
@@ -259,15 +257,10 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
             result = hdr["result"]
             count = hdr["count"]
             print(f"完成！结果: {result}  TT 条目: {count:,}{elapsed_str}")
-        elif hdr and hdr["status"] == 2:
-            print(f"失败：所有 worker 均异常退出{elapsed_str}")
-            print(crashed_info)
-            update_problem(_DB_PATH, problem_id, precompute_status="none")
-            sys.exit(1)
         else:
             print(f"完成（结果未知）{elapsed_str}")
-        if crashed_info:
-            print(crashed_info)
+        if retry_info:
+            print(retry_info)
         update_problem(_DB_PATH, problem_id,
                        precompute_status="done", precompute_job_id=job_id)
     except KeyboardInterrupt:
@@ -310,6 +303,9 @@ def _print_worker_table(workers: list):
         ec = w.get("exitcode")
         ec_str = str(ec) if ec is not None else "-"
         notes = []
+        retries = w.get("retries", 0)
+        if retries > 0:
+            notes.append(f"重启{retries}次")
         err = w.get("error")
         if err:
             notes.append(err)
