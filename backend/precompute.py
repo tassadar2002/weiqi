@@ -164,6 +164,7 @@ def _worker_solve(board_grid: List[int], last_capture: int,
             info["total_nodes"] = total_nodes + info["nodes"]
             info["current_move"] = [mx, my]
             info["tt_flushed"] = last_flush
+            info["tt_size"] = len(solver.tt)
             try:
                 with open(progress_path, "w") as f:
                     json.dump(info, f)
@@ -200,23 +201,31 @@ def _worker_solve(board_grid: List[int], last_capture: int,
 # 进度汇总
 # ============================================================
 
-def _aggregate_progress(workers: List[dict], progress_path: str) -> None:
+def _aggregate_progress(workers: List[dict], progress_path: str,
+                        start_time: float) -> None:
     total_nodes = 0
+    total_tt = 0
     active = 0
     for w in workers:
         try:
             with open(w["progress"]) as f:
                 wp = json.load(f)
             total_nodes += wp.get("total_nodes", wp.get("nodes", 0))
+            total_tt += wp.get("tt_size", wp.get("tt_flushed", 0))
             if wp.get("status") == "running":
                 active += 1
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
+    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+    nps = int(total_nodes / max(elapsed_ms, 1) * 1000)
     try:
         with open(progress_path, "w") as f:
             json.dump({
                 "status": "running" if active > 0 else "merging",
                 "total_nodes": total_nodes,
+                "total_tt": total_tt,
+                "elapsed_ms": elapsed_ms,
+                "nodes_per_sec": nps,
                 "workers_active": active,
                 "workers_total": len(workers),
             }, f)
@@ -321,6 +330,7 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     cache_dir = os.path.dirname(db_path) or "."
     job_id = os.path.splitext(os.path.basename(db_path))[0]
     workers = []
+    start_time = time.monotonic()
     for wi in range(num_workers):
         if not buckets[wi]:
             continue
@@ -334,11 +344,19 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
         p.start()
         workers.append({"process": p, "db": wdb, "progress": wprog})
 
+    # 写 worker PID 文件（供外部终止）
+    pids_path = os.path.join(cache_dir, f"{job_id}_pids.json")
+    try:
+        with open(pids_path, "w") as f:
+            json.dump([w["process"].pid for w in workers], f)
+    except OSError:
+        pass
+
     # 等待
     while any(w["process"].is_alive() for w in workers):
-        _aggregate_progress(workers, progress_path)
+        _aggregate_progress(workers, progress_path, start_time)
         time.sleep(2)
-    _aggregate_progress(workers, progress_path)
+    _aggregate_progress(workers, progress_path, start_time)
 
     # 合并
     _merge_worker_dbs(workers, db_path, attacker_color, first_turn)

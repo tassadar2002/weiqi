@@ -26,6 +26,7 @@
   <div id="detail-topbar">
     <button id="btn-back-list" class="ctrl-btn">← 返回列表</button>
     <input id="problem-title" class="title-input" value="未命名习题" />
+    <span id="phase-badge" class="phase-badge"></span>
     <button id="btn-save" class="ctrl-btn">保存</button>
     <button id="btn-delete" class="ctrl-btn btn-danger">删除</button>
   </div>
@@ -42,8 +43,10 @@
     </section>
 
     <aside id="sidebar">
+      <!-- ===== 设置阶段的卡片 ===== -->
+
       <!-- 布局 -->
-      <div id="layout-controls" class="card">
+      <div id="layout-controls" class="card hidden">
         <h3 class="section-title">① 布局</h3>
         <div id="color-selector">
           <button id="sel-black" class="tool-btn active-tool"><span class="stone-icon black-stone"></span>黑子</button>
@@ -63,29 +66,51 @@
         </div>
         <div class="btn-row">
           <button id="btn-back-layout" class="ctrl-btn">返回布局</button>
-          <button id="btn-to-solve" class="start-btn">下一步：解题</button>
+          <button id="btn-to-target" class="start-btn">下一步：设定目标</button>
         </div>
       </div>
 
-      <!-- 解题 -->
-      <div id="play-controls" class="card hidden">
-        <h3 class="section-title">③ 解题</h3>
+      <!-- 目标 -->
+      <div id="target-controls" class="card hidden">
+        <h3 class="section-title">③ 设定目标</h3>
         <p id="target-label" class="hint">未选目标</p>
+        <p class="hint">点白子=杀(红)，点黑子=守(蓝)，再点取消</p>
         <div class="btn-row">
-          <button id="btn-pick-target" class="ctrl-btn">设定目标</button>
-          <button id="btn-confirm-target" class="ctrl-btn hidden" style="font-weight:700;color:var(--jade-dark);">确认目标</button>
+          <button id="btn-confirm-target" class="start-btn">确认目标</button>
         </div>
         <div class="btn-row">
-          <button id="btn-precompute" class="ctrl-btn hidden">开始预处理</button>
-          <button id="btn-stop-precompute" class="ctrl-btn hidden btn-danger">停止</button>
+          <button id="btn-back-region" class="ctrl-btn">返回落子点</button>
         </div>
+      </div>
+
+      <!-- 预处理 -->
+      <div id="precompute-controls" class="card hidden">
+        <h3 class="section-title">④ 预处理</h3>
+        <p id="precompute-label" class="hint">预处理可加速解题（可选）</p>
         <div id="precompute-progress" class="hidden">
-          <div id="precompute-stats" class="hint"></div>
-          <div class="progress-bar-bg"><div id="precompute-bar" class="progress-bar"></div></div>
+          <div id="precompute-stats" class="precompute-stats"></div>
         </div>
-        <button id="btn-autoplay" class="start-btn hidden">最优解</button>
         <div class="btn-row">
-          <button id="btn-reset" class="ctrl-btn">返回布局</button>
+          <button id="btn-precompute" class="start-btn">开始预处理</button>
+          <button id="btn-stop-precompute" class="ctrl-btn hidden btn-danger">停止预处理</button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-back-target" class="ctrl-btn">返回目标</button>
+          <button id="btn-finish-setup" class="start-btn">完成设置</button>
+        </div>
+      </div>
+
+      <!-- ===== 解题阶段的卡片 ===== -->
+
+      <!-- 解题控制 -->
+      <div id="solve-controls" class="card hidden">
+        <h3 class="section-title">解题</h3>
+        <p id="solve-target-label" class="hint"></p>
+        <div class="btn-row">
+          <button id="btn-autoplay" class="start-btn">最优解</button>
+        </div>
+        <div class="btn-row">
+          <button id="btn-reset-solve" class="ctrl-btn">重置</button>
         </div>
       </div>
 

@@ -341,9 +341,24 @@ class Handler(BaseHTTPRequestHandler):
     def _h_precompute_stop(self, data):
         job_id = data["job_id"]
         job = _JOBS.get(job_id)
-        if job and job["process"].is_alive():
-            job["process"].terminate()
-            job["process"].join(timeout=5)
+        if job:
+            # 先杀 worker 子进程
+            pids_path = os.path.join(CACHE_DIR, f"{job_id}_pids.json")
+            try:
+                import signal
+                with open(pids_path) as f:
+                    pids = json.load(f)
+                for pid in pids:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                pass
+            # 再杀 coordinator
+            if job["process"].is_alive():
+                job["process"].terminate()
+                job["process"].join(timeout=5)
         if "problem_id" in data:
             update_problem(PROBLEMS_DB, data["problem_id"], precompute_status="none")
         self._json(200, {"ok": True})

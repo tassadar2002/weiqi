@@ -57,6 +57,8 @@ def list_problems(db_path: str) -> List[dict]:
         white_count = sum(1 for c in grid if c == -1)
         region = json.loads(r["region_mask"])
         region_count = sum(region)
+        kill_targets = json.loads(r["kill_targets"])
+        defend_targets = json.loads(r["defend_targets"])
         result.append({
             "id": r["id"],
             "name": r["name"],
@@ -64,6 +66,8 @@ def list_problems(db_path: str) -> List[dict]:
             "black_count": black_count,
             "white_count": white_count,
             "region_count": region_count,
+            "kill_count": len(kill_targets),
+            "defend_count": len(defend_targets),
             "precompute_status": r["precompute_status"],
             "created_at": r["created_at"],
             "updated_at": r["updated_at"],
