@@ -290,21 +290,6 @@ class Coordinator:
         self._write_final_progress()
 
 
-# ── 兼容旧接口 ──
-
-def run_precompute_parallel(board_grid, last_capture, region,
-                            kill_targets, defend_targets,
-                            attacker_color, first_turn,
-                            bin_path, progress_path,
-                            num_workers=None):
-    """兼容旧调用方式。"""
-    c = Coordinator(board_grid, last_capture, region,
-                    kill_targets, defend_targets,
-                    attacker_color, first_turn,
-                    bin_path, progress_path, num_workers)
-    c.run()
-
-
 # ── CLI 入口 ──
 
 if __name__ == "__main__":
@@ -314,10 +299,10 @@ if __name__ == "__main__":
         sys.exit(1)
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    run_precompute_parallel(
+    Coordinator(
         cfg["board"], cfg["last_capture"], cfg["region"],
         cfg["kill_targets"], cfg["defend_targets"],
         cfg["attacker_color"], cfg["turn"],
         cfg["db_path"], cfg["progress_path"],
         cfg.get("num_workers"),
-    )
+    ).run()

@@ -196,7 +196,7 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
     """对指定题目运行预处理。"""
     import threading
     import uuid as _uuid
-    from precompute import run_precompute_parallel
+    from coordinator import Coordinator
     from problems import get_problem, init_db, update_problem
     init_db(_DB_PATH)
     p = get_problem(_DB_PATH, problem_id)
@@ -228,14 +228,14 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
     printer.start()
 
     try:
-        run_precompute_parallel(
+        Coordinator(
             p["board_grid"], p.get("last_capture", -1),
             p["region_mask"],
             p["kill_targets"], p["defend_targets"],
             p.get("attacker_color", BLACK), BLACK,
             bin_path, progress_path,
             num_workers,
-        )
+        ).run()
         stop_event.set()
         printer.join(timeout=1)
         sys.stdout.write("\r" + " " * 80 + "\r")  # 清行
