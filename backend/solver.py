@@ -48,6 +48,7 @@ class DfpnSolver:
         self.progress_callback = progress_callback
 
         self.tt: Dict[tuple, Tuple[int, int]] = {}
+        self.tt_log: List[tuple] = []  # 新增 key 的有序列表（用于增量 flush）
         self.nodes = 0
         self.start_time = 0.0
         self._initial_turn = 0  # 记录 solve() 传入的 turn，供 progress 查根
@@ -62,7 +63,10 @@ class DfpnSolver:
         return self.tt.get(self._tt_key(turn), (1, 1))
 
     def _tt_set(self, turn: int, pn: int, dn: int) -> None:
-        self.tt[self._tt_key(turn)] = (pn, dn)
+        key = self._tt_key(turn)
+        if key not in self.tt:
+            self.tt_log.append(key)
+        self.tt[key] = (pn, dn)
 
     # ---- 终止判定（多目标）----
 

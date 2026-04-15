@@ -40,12 +40,13 @@ def _get_meta(db: sqlite3.Connection, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def _flush_tt(db: sqlite3.Connection, tt_dict: Dict, already_flushed: int) -> None:
-    """增量写入：只写 dict 中 index >= already_flushed 的新条目。"""
-    items = list(tt_dict.items())[already_flushed:]
-    if items:
+def _flush_tt_from_log(db: sqlite3.Connection, solver, already_flushed: int) -> None:
+    """增量写入：只写 tt_log 中 index >= already_flushed 的新条目。O(新增量)。"""
+    new_keys = solver.tt_log[already_flushed:]
+    if new_keys:
+        tt = solver.tt
         db.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)",
-                       [(_tt_key_to_str(k), v[0], v[1]) for k, v in items])
+                       [(_tt_key_to_str(k), tt[k][0], tt[k][1]) for k in new_keys])
 
 
 def _tt_key_to_str(key) -> str:
@@ -166,9 +167,9 @@ def _worker_solve(board_grid: List[int], last_capture: int,
 
         def on_progress(info):
             nonlocal last_flush
-            new_count = len(solver.tt)
+            new_count = len(solver.tt_log)
             if new_count - last_flush >= BATCH:
-                _flush_tt(db, solver.tt, last_flush)
+                _flush_tt_from_log(db, solver, last_flush)
                 last_flush = new_count
                 db.commit()
             info["status"] = "running"
@@ -193,7 +194,7 @@ def _worker_solve(board_grid: List[int], last_capture: int,
         total_nodes += r["nodes"]
 
         # flush 剩余
-        _flush_tt(db, solver.tt, last_flush)
+        _flush_tt_from_log(db, solver, last_flush)
         db.execute("INSERT OR REPLACE INTO results (move, pn, dn, nodes) VALUES (?, ?, ?, ?)",
                    (f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
         db.commit()
