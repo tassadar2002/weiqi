@@ -41,18 +41,6 @@ const API = {
     });
   },
 
-  // 预处理
-  async precomputeStart(boardArr, lastCapture, region, killTargets, defendTargets, attackerColor, turn, problemId) {
-    return postJson('/api/precompute/start', {
-      board: boardArr, last_capture: lastCapture, region,
-      kill_targets: killTargets, defend_targets: defendTargets,
-      attacker_color: attackerColor, turn, problem_id: problemId,
-    });
-  },
-  async precomputeStatus(jobId) { return postJson('/api/precompute/status', {job_id: jobId}); },
-  async precomputeStop(jobId, problemId) {
-    return postJson('/api/precompute/stop', {job_id: jobId, problem_id: problemId});
-  },
 };
 
 async function postJson(url, data) {

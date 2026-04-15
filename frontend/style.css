@@ -145,13 +145,6 @@ main { display:grid; grid-template-columns:1fr 280px; gap:2rem; align-items:star
 .tag-win { background:rgba(91,140,111,0.22); color:var(--jade-dark); }
 .tag-resist { background:rgba(199,62,58,0.18); color:var(--vermillion); }
 
-/* 预处理进度文字 */
-.precompute-stats { font-size:0.78rem; line-height:1.7; color:var(--ink-medium); }
-.precompute-stats .stat-line { display:flex; justify-content:space-between; }
-.precompute-stats .stat-label { color:var(--ink-light); }
-.precompute-stats .stat-value { font-weight:700; color:var(--ink-dark); font-variant-numeric:tabular-nums; }
-.precompute-stats .stat-timer { font-size:0.85rem; font-weight:700; color:var(--jade-dark); margin-bottom:0.3rem; }
-
 @media (max-width:840px) {
   main { grid-template-columns:1fr; gap:1rem; }
   #detail-view { padding:0 1rem; }

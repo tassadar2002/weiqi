@@ -11,7 +11,7 @@ class App {
     this.renderer = null;
     // 当前阶段: 'setup' | 'solve'
     this.phase = null;
-    // 设置阶段模式: 'layout' | 'region' | 'pick-target' | 'precompute'
+    // 设置阶段模式: 'layout' | 'region' | 'pick-target'
     // 解题阶段模式: 'play'
     this.mode = null;
     this.placementColor = 'black';
@@ -27,7 +27,6 @@ class App {
     this.moveCounter = 0;
     this.decisionLog = [];
     this.precomputeJobId = null;
-    this.precomputeTimer = null;
     // 解题前保存的初始棋盘（用于重置）
     this.initialBoard = null;
     this.initialLastCapture = -1;
@@ -53,11 +52,6 @@ class App {
     // 设置阶段 — 目标
     document.getElementById('btn-confirm-target').addEventListener('click', () => this.confirmTarget());
     document.getElementById('btn-back-region').addEventListener('click', () => this.enterRegionMode());
-    // 设置阶段 — 预处理
-    document.getElementById('btn-precompute').addEventListener('click', () => this.startPrecompute());
-    document.getElementById('btn-stop-precompute').addEventListener('click', () => this.stopPrecompute());
-    document.getElementById('btn-back-target').addEventListener('click', () => this.enterPickTarget());
-    document.getElementById('btn-finish-setup').addEventListener('click', () => this.finishSetup());
     // 解题阶段
     document.getElementById('btn-autoplay').addEventListener('click', () => this.toggleAutoplay());
     document.getElementById('btn-reset-solve').addEventListener('click', () => this.resetSolve());
@@ -226,18 +220,8 @@ class App {
     this.render();
   }
 
-  enterPrecomputeMode() {
-    this.mode = 'precompute';
-    this._showSetupCard('precompute-controls');
-    this.updatePrecomputeLabel();
-    document.getElementById('move-dot').className = 'layout';
-    document.getElementById('move-text').textContent = '预处理阶段';
-    this.hideFeedback();
-    this.render();
-  }
-
   _showSetupCard(id) {
-    ['layout-controls', 'region-controls', 'target-controls', 'precompute-controls',
+    ['layout-controls', 'region-controls', 'target-controls',
      'solve-controls', 'decision-log'].forEach(
       c => document.getElementById(c).classList.add('hidden'));
     document.getElementById(id).classList.remove('hidden');
@@ -262,7 +246,7 @@ class App {
     this.showFeedback('correct', `已添加 ${info.color===W?'杀(红)':'守(蓝)'}：(${bx},${by})`);
   }
 
-  confirmTarget() {
+  async confirmTarget() {
     if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
       this.showFeedback('incorrect', '至少选一个目标'); return;
     }
@@ -272,15 +256,9 @@ class App {
       defend_targets_coords: this.defendTargets.map(t => t.coord),
     };
     this.canvas_cursor('');
-    this.showFeedback('correct', '目标已确认');
-    // 自动保存目标
-    this.saveProblem();
-    // 进入预处理步骤
-    this.enterPrecomputeMode();
-  }
-
-  async finishSetup() {
+    // 自动保存并返回列表
     await this.saveProblem();
+    this.showFeedback('correct', '目标已确认，已保存');
     this.showListView();
   }
 
@@ -361,121 +339,6 @@ class App {
       el.textContent = '练习';
       el.className = 'phase-badge phase-solve';
     }
-  }
-
-  // ============================================================
-  // 预处理
-  // ============================================================
-
-  updatePrecomputeLabel() {
-    const el = document.getElementById('precompute-label');
-    if (this.problemData && this.problemData.precompute_status === 'done') {
-      el.textContent = '已完成预处理';
-      el.style.color = 'var(--jade-dark)';
-      document.getElementById('btn-precompute').textContent = '重新预处理';
-    } else {
-      el.textContent = '预处理可加速解题（可选）';
-      el.style.color = '';
-      document.getElementById('btn-precompute').textContent = '开始预处理';
-    }
-  }
-
-  async startPrecompute() {
-    if (!this.targetInfo) { this.showFeedback('incorrect', '请先确认目标'); return; }
-    await this.saveProblem();
-    const r = await API.precomputeStart(
-      this.board.toArray(), this.board.lastCapture,
-      Array.from(this.regionMask),
-      this.killTargets.map(t => t.coord),
-      this.defendTargets.map(t => t.coord),
-      B, B, this.problemId,
-    );
-    this.precomputeJobId = r.job_id;
-    this.precomputeStartedAt = Date.now();
-    this.precomputeWorkerCount = r.workers;
-    document.getElementById('btn-precompute').classList.add('hidden');
-    document.getElementById('btn-stop-precompute').classList.remove('hidden');
-    document.getElementById('precompute-progress').classList.remove('hidden');
-    this._startPrecomputeTimer();
-    this.precomputePollTimer = setInterval(() => this.pollPrecompute(), 2000);
-    this.showFeedback('correct', `预处理已启动（${r.workers} 进程）`);
-  }
-
-  _startPrecomputeTimer() {
-    this._lastPrecomputeData = null;
-    this._updatePrecomputeDisplay();
-    this.precomputeTickTimer = setInterval(() => this._updatePrecomputeDisplay(), 1000);
-  }
-
-  _formatDuration(ms) {
-    const s = Math.floor(ms / 1000);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
-    return `${m}:${String(sec).padStart(2,'0')}`;
-  }
-
-  _updatePrecomputeDisplay() {
-    const el = document.getElementById('precompute-stats');
-    const elapsed = Date.now() - (this.precomputeStartedAt || Date.now());
-    const d = this._lastPrecomputeData || {};
-    const status = d.status === 'merging' ? '合并中...' : '计算中...';
-    const nodes = (d.total_nodes || 0).toLocaleString();
-    const tt = (d.total_tt || 0).toLocaleString();
-    const nps = (d.nodes_per_sec || 0).toLocaleString();
-    const wa = d.workers_active != null ? d.workers_active : (this.precomputeWorkerCount || '?');
-    const wt = d.workers_total || this.precomputeWorkerCount || '?';
-    el.innerHTML = `<div class="stat-timer">${status} ${this._formatDuration(elapsed)}</div>`
-      + `<div class="stat-line"><span class="stat-label">搜索节点</span><span class="stat-value">${nodes}</span></div>`
-      + `<div class="stat-line"><span class="stat-label">TT 缓存</span><span class="stat-value">${tt} 条</span></div>`
-      + `<div class="stat-line"><span class="stat-label">速度</span><span class="stat-value">${nps} n/s</span></div>`
-      + `<div class="stat-line"><span class="stat-label">进程</span><span class="stat-value">${wa} / ${wt}</span></div>`;
-  }
-
-  async pollPrecompute() {
-    if (!this.precomputeJobId) return;
-    const r = await API.precomputeStatus(this.precomputeJobId);
-    this._lastPrecomputeData = r;
-    this._updatePrecomputeDisplay();
-    if (r.status === 'done') {
-      this._stopPrecomputeTimers();
-      document.getElementById('btn-stop-precompute').classList.add('hidden');
-      document.getElementById('btn-precompute').classList.remove('hidden');
-      const elapsed = this._formatDuration(Date.now() - (this.precomputeStartedAt || Date.now()));
-      this.showFeedback('correct', `预处理完成！${r.result || ''} TT=${(r.tt_size||0).toLocaleString()}条 用时${elapsed}`);
-      if (this.problemId) {
-        await API.updateProblem(this.problemId, {precompute_status: 'done', precompute_job_id: this.precomputeJobId});
-        this.problemData.precompute_status = 'done';
-      }
-      this.updatePrecomputeLabel();
-    } else if (r.status === 'crashed') {
-      this._stopPrecomputeTimers();
-      document.getElementById('btn-stop-precompute').classList.add('hidden');
-      document.getElementById('btn-precompute').classList.remove('hidden');
-      document.getElementById('precompute-progress').classList.add('hidden');
-      this.showFeedback('incorrect', '预处理异常终止');
-    }
-  }
-
-  async stopPrecompute() {
-    if (this.precomputeJobId) {
-      await API.precomputeStop(this.precomputeJobId, this.problemId);
-    }
-    this._stopPrecomputeTimers();
-    document.getElementById('btn-stop-precompute').classList.add('hidden');
-    document.getElementById('btn-precompute').classList.remove('hidden');
-    document.getElementById('precompute-progress').classList.add('hidden');
-    this.showFeedback('incorrect', '预处理已停止');
-  }
-
-  _stopPrecomputeTimers() {
-    if (this.precomputePollTimer) { clearInterval(this.precomputePollTimer); this.precomputePollTimer = null; }
-    if (this.precomputeTickTimer) { clearInterval(this.precomputeTickTimer); this.precomputeTickTimer = null; }
-  }
-
-  stopPrecomputePoll() {
-    this._stopPrecomputeTimers();
   }
 
   // ============================================================

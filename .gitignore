@@ -78,3 +78,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+backend/cache
+backend/data

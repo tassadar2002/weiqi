@@ -7,14 +7,9 @@ weiqi3 后端 HTTP 服务
 """
 
 import json
-import multiprocessing
 import os
 import re
-import shutil
-import subprocess
 import sys
-import time
-import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from precompute import BinCache, solve_from_cache, _read_header
+from precompute import BinCache, solve_from_cache
 from problems import (create_problem, delete_problem, get_problem, init_db,
                        list_problems, update_problem)
 from target import validate_target_stone
@@ -36,13 +31,6 @@ CACHE_DIR = os.path.join(PROJECT_ROOT, "backend", "cache")
 os.makedirs(os.path.join(PROJECT_ROOT, "backend", "data"), exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 init_db(PROBLEMS_DB)
-
-# 预处理用 pypy3（优先），否则回退当前解释器
-_PYPY3 = shutil.which("pypy3")
-_PRECOMPUTE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "precompute.py")
-
-# 预处理任务
-_JOBS: Dict[str, dict] = {}
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -179,12 +167,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._h_legal_moves(data)
             elif path == "/api/solve":
                 self._h_solve(data)
-            elif path == "/api/precompute/start":
-                self._h_precompute_start(data)
-            elif path == "/api/precompute/status":
-                self._h_precompute_status(data)
-            elif path == "/api/precompute/stop":
-                self._h_precompute_stop(data)
             else:
                 self.send_error(404)
         except Exception as e:
@@ -242,9 +224,9 @@ class Handler(BaseHTTPRequestHandler):
         # 检查预处理缓存
         cache_id = data.get("precompute_cache_id")
         if cache_id:
-            job = _JOBS.get(cache_id)
-            if job and os.path.exists(job["bin_path"]):
-                with BinCache(job["bin_path"]) as cache:
+            bin_path = os.path.join(CACHE_DIR, f"{cache_id}.bin")
+            if os.path.exists(bin_path):
+                with BinCache(bin_path) as cache:
                     result = solve_from_cache(cache, board, turn, region, attacker)
                 result["cached"] = True
                 result["multi_status"] = _multi_status(
@@ -295,91 +277,6 @@ class Handler(BaseHTTPRequestHandler):
         if any_move:
             return {"x": any_move[0], "y": any_move[1], "certain": False}
         return None
-
-    # ---- Precompute ----
-
-    def _h_precompute_start(self, data):
-        job_id = uuid.uuid4().hex[:12]
-        bin_path = os.path.join(CACHE_DIR, f"{job_id}.bin")
-        progress_path = os.path.join(CACHE_DIR, f"{job_id}_progress.json")
-        config_path = os.path.join(CACHE_DIR, f"{job_id}_config.json")
-        with open(config_path, "w") as f:
-            json.dump({
-                "board": data["board"],
-                "last_capture": data.get("last_capture", -1),
-                "region": data["region"],
-                "kill_targets": data["kill_targets"],
-                "defend_targets": data["defend_targets"],
-                "attacker_color": int(data["attacker_color"]),
-                "turn": int(data.get("turn", 1)),
-                "db_path": bin_path,
-                "progress_path": progress_path,
-                "num_workers": None,
-            }, f)
-        interpreter = _PYPY3 or sys.executable
-        p = subprocess.Popen(
-            [interpreter, _PRECOMPUTE_SCRIPT, config_path],
-            cwd=os.path.dirname(_PRECOMPUTE_SCRIPT),
-        )
-        _JOBS[job_id] = {"process": p, "bin_path": bin_path,
-                         "progress_path": progress_path, "config_path": config_path}
-        # 关联到习题
-        if "problem_id" in data:
-            update_problem(PROBLEMS_DB, data["problem_id"],
-                           precompute_status="running", precompute_job_id=job_id)
-        self._json(200, {"job_id": job_id, "workers": max(1, multiprocessing.cpu_count() - 1)})
-
-    def _h_precompute_status(self, data):
-        job_id = data["job_id"]
-        job = _JOBS.get(job_id)
-        if not job:
-            self._json(200, {"status": "not_found"}); return
-        try:
-            with open(job["progress_path"]) as f:
-                progress = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            progress = {"status": "starting", "total_nodes": 0}
-        proc = job["process"]
-        is_alive = proc.poll() is None
-        if not is_alive and progress.get("status") not in ("done", "merging"):
-            progress["status"] = "done" if os.path.exists(job["bin_path"]) else "crashed"
-        # 检查 .bin header 是否已合并完成
-        if progress.get("status") in ("done", "merging") and os.path.exists(job["bin_path"]):
-            hdr = _read_header(job["bin_path"])
-            if hdr and hdr["status"] == 1:  # 1=done
-                progress["status"] = "done"
-                progress["result"] = hdr["result"]
-                progress["tt_size"] = hdr["count"]
-        self._json(200, progress)
-
-    def _h_precompute_stop(self, data):
-        job_id = data["job_id"]
-        job = _JOBS.get(job_id)
-        if job:
-            # 先杀 worker 子进程
-            pids_path = os.path.join(CACHE_DIR, f"{job_id}_pids.json")
-            try:
-                import signal
-                with open(pids_path) as f:
-                    pids = json.load(f)
-                for pid in pids:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        pass
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                pass
-            # 再杀 coordinator（subprocess.Popen）
-            proc = job["process"]
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-        if "problem_id" in data:
-            update_problem(PROBLEMS_DB, data["problem_id"], precompute_status="none")
-        self._json(200, {"ok": True})
 
     def do_OPTIONS(self):
         self.send_response(200)
