@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from precompute import BinCache, solve_from_cache
+from bincache import BinCache, solve_from_cache
 from problems import (create_problem, delete_problem, get_problem, init_db,
                        list_problems, update_problem)
 from target import validate_target_stone
