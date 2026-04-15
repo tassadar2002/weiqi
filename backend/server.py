@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from precompute import load_tt_from_bin, solve_from_cache, _read_header
+from precompute import BinCache, solve_from_cache, _read_header
 from problems import (create_problem, delete_problem, get_problem, init_db,
                        list_problems, update_problem)
 from target import validate_target_stone
@@ -244,8 +244,8 @@ class Handler(BaseHTTPRequestHandler):
         if cache_id:
             job = _JOBS.get(cache_id)
             if job and os.path.exists(job["bin_path"]):
-                tt = load_tt_from_bin(job["bin_path"])
-                result = solve_from_cache(tt, board, turn, region, attacker)
+                with BinCache(job["bin_path"]) as cache:
+                    result = solve_from_cache(cache, board, turn, region, attacker)
                 result["cached"] = True
                 result["multi_status"] = _multi_status(
                     board, [list(c) for c in kill_coords], [list(c) for c in defend_coords])

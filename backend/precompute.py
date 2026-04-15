@@ -3,17 +3,19 @@
 
 - run_precompute_parallel: 多进程并行穷举 df-pn
 - solve_from_cache: 预处理完成后的查表求解
-- load_tt_from_bin: 从二进制文件加载 TT 到内存
+- BinCache: mmap + 二分查找，支持超大文件按需查询
 
 二进制缓存格式 (.bin):
   Header (20B): magic "WQ3C" + version u8 + status u8 + result u8 + pad u8
                 + count u32 + root_pn u32 + root_dn u32
-  Records (12B each): key 10B (zh u64 + turn i8 + lc u8) + pn u8 + dn u8
+  Records (12B each, 按 key 排序): key 10B (zh u64 + turn i8 + lc u8) + pn u8 + dn u8
   pn/dn 编码: 0~254 原值, 255 = DFPN_INF (10^9)
-  增量写入时允许重复 key，合并阶段去重（后覆盖前）。
+  主 .bin 文件中 records 按 key 排序，支持二分查找。
 """
 
+import heapq
 import json
+import mmap
 import multiprocessing as mp
 import os
 import struct
@@ -27,7 +29,7 @@ DFPN_INF = 10**9
 _MAGIC = b"WQ3C"
 _HEADER_FMT = ">4sBBBxIII"  # 20 bytes
 _HEADER_SIZE = struct.calcsize(_HEADER_FMT)  # 20
-_RECORD_FMT = ">QbBBB"  # 12 bytes: zh(8) + turn(1) + lc(1) + pn(1) + dn(1)
+_RECORD_FMT = ">QBBBB"  # 12 bytes: zh(8) + turn(1) + lc(1) + pn(1) + dn(1)
 _RECORD_SIZE = struct.calcsize(_RECORD_FMT)  # 12
 
 # status: 0=running 1=done 2=stopped
@@ -46,15 +48,30 @@ def _encode_pn(v: int) -> int:
 def _decode_pn(v: int) -> int:
     return DFPN_INF if v == 255 else v
 
-def _pack_key(key: tuple) -> bytes:
-    """TT key (zh, turn, lc) → 10 字节。"""
-    zh, turn, lc = key
-    return struct.pack(">QbB", zh, turn, lc if lc >= 0 else 255)
+def _encode_turn(turn: int) -> int:
+    """turn (-1 or 1) → unsigned byte (0 or 2)。保证字节序 = 数值序。"""
+    return turn + 1  # -1→0, 1→2
 
-def _unpack_key(blob: bytes) -> tuple:
-    """10 字节 → (zh, turn, lc)。"""
-    zh, turn, lc_u8 = struct.unpack(">QbB", blob)
-    return (zh, turn, -1 if lc_u8 == 255 else lc_u8)
+def _decode_turn(v: int) -> int:
+    return v - 1  # 0→-1, 2→1
+
+def _encode_lc(lc: int) -> int:
+    """last_capture (-1 or 0~168) → unsigned byte。-1 排最前（编码为 0），0~168 编码为 1~169。"""
+    return 0 if lc < 0 else lc + 1
+
+def _decode_lc(v: int) -> int:
+    return -1 if v == 0 else v - 1
+
+def _pack_key(key: tuple) -> bytes:
+    """TT key (zh, turn, lc) → 10 字节。大端序，字节比较 = 数值比较。"""
+    zh, turn, lc = key
+    return struct.pack(">QBB", zh, _encode_turn(turn), _encode_lc(lc))
+
+def _pack_record(key: tuple, pn: int, dn: int) -> bytes:
+    """TT (key, pn, dn) → 12 字节。"""
+    zh, turn, lc = key
+    return struct.pack(_RECORD_FMT, zh, _encode_turn(turn), _encode_lc(lc),
+                       _encode_pn(pn), _encode_pn(dn))
 
 def _write_header(f, status=0, result=0, count=0, root_pn=0, root_dn=0):
     f.seek(0)
@@ -77,7 +94,7 @@ def _read_header(path: str) -> Optional[dict]:
         return None
 
 def _flush_records(f, solver, already_flushed: int) -> int:
-    """增量追加新 TT 记录到文件。返回新的 flushed 计数。"""
+    """增量追加新 TT 记录到文件（运行中崩溃安全）。"""
     new_keys = solver.tt_log[already_flushed:]
     if not new_keys:
         return already_flushed
@@ -88,50 +105,94 @@ def _flush_records(f, solver, already_flushed: int) -> int:
         pn, dn = tt[k]
         zh, turn, lc = k
         struct.pack_into(_RECORD_FMT, buf, offset,
-                         zh, turn, lc if lc >= 0 else 255,
+                         zh, _encode_turn(turn), _encode_lc(lc),
                          _encode_pn(pn), _encode_pn(dn))
         offset += _RECORD_SIZE
     f.write(buf)
     f.flush()
     return already_flushed + len(new_keys)
 
-def _read_records(path: str) -> Dict[tuple, Tuple[int, int]]:
-    """读取 .bin 文件所有记录，后出现的 key 覆盖前面的（去重）。"""
-    tt = {}
+def _dump_sorted_bin(bin_path: str, tt: Dict[tuple, Tuple[int, int]],
+                     child_results: list) -> None:
+    """将内存 TT dict 排序后写入 .bin 文件（去重 + 排序）。"""
+    items = sorted(tt.items())
+    with open(bin_path, "wb") as f:
+        _write_header(f, status=1, count=len(items))
+        for key, (pn, dn) in items:
+            f.write(_pack_record(key, pn, dn))
+    # child_results 写到 JSON
+    results_path = bin_path + ".results.json"
     try:
-        with open(path, "rb") as f:
-            header = f.read(_HEADER_SIZE)
-            if len(header) < _HEADER_SIZE:
-                return tt
-            while True:
-                rec = f.read(_RECORD_SIZE)
-                if len(rec) < _RECORD_SIZE:
-                    break
-                zh, turn, lc_u8, pn_u8, dn_u8 = struct.unpack(_RECORD_FMT, rec)
-                key = (zh, turn, -1 if lc_u8 == 255 else lc_u8)
-                tt[key] = (_decode_pn(pn_u8), _decode_pn(dn_u8))
+        with open(results_path, "w") as rf:
+            json.dump(child_results, rf)
     except OSError:
         pass
-    return tt
 
-def load_tt_from_bin(path: str) -> Dict[tuple, Tuple[int, int]]:
-    """从 .bin 文件加载 TT 到内存 dict。"""
-    return _read_records(path)
+
+# ============================================================
+# BinCache: mmap + 二分查找
+# ============================================================
+
+class BinCache:
+    """mmap 映射 .bin 文件，二分查找按需查询。内存占用 ~0。"""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.f = open(path, "rb")
+        size = os.fstat(self.f.fileno()).st_size
+        if size < _HEADER_SIZE:
+            self.mm = None
+            self.count = 0
+            self.header = None
+            return
+        self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ)
+        self.header = _read_header(path)
+        self.count = self.header["count"] if self.header else 0
+
+    def lookup(self, key: tuple) -> Optional[Tuple[int, int]]:
+        if self.mm is None or self.count == 0:
+            return None
+        target = _pack_key(key)
+        lo, hi = 0, self.count
+        while lo < hi:
+            mid = (lo + hi) // 2
+            off = _HEADER_SIZE + mid * _RECORD_SIZE
+            rec_key = self.mm[off:off + 10]
+            if rec_key < target:
+                lo = mid + 1
+            elif rec_key > target:
+                hi = mid
+            else:
+                return (_decode_pn(self.mm[off + 10]), _decode_pn(self.mm[off + 11]))
+        return None
+
+    def close(self):
+        if self.mm:
+            self.mm.close()
+            self.mm = None
+        self.f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 # ============================================================
 # 查表求解（预处理完成后）
 # ============================================================
 
-def solve_from_cache(tt: Dict[tuple, Tuple[int, int]],
+def solve_from_cache(cache: BinCache,
                      board: Board, turn: int, region_mask: List[int],
                      attacker_color: int) -> dict:
-    """纯查表，不跑 df-pn。毫秒级。"""
+    """纯查表（mmap 二分查找），不跑 df-pn。毫秒级。"""
 
-    def tt_key(t: int) -> tuple:
-        return (board.zh, t, board.last_capture)
+    def tt_lookup(t: int) -> Tuple[int, int]:
+        r = cache.lookup((board.zh, t, board.last_capture))
+        return r if r else (1, 1)
 
-    root_pn, root_dn = tt.get(tt_key(turn), (1, 1))
+    root_pn, root_dn = tt_lookup(turn)
     if root_pn == 0:
         result = "ATTACKER_WINS"
     elif root_dn == 0:
@@ -151,7 +212,7 @@ def solve_from_cache(tt: Dict[tuple, Tuple[int, int]],
         u = board.play_undoable(x, y, turn)
         if u is None:
             continue
-        child_pn, child_dn = tt.get(tt_key(-turn), (1, 1))
+        child_pn, child_dn = tt_lookup(-turn)
         board.undo(u)
 
         if is_or and child_pn == 0:
@@ -188,20 +249,23 @@ def _worker_solve(board_grid: List[int], last_capture: int,
                   attacker_color: int, first_turn: int,
                   my_moves: List[Tuple[int, int]],
                   bin_path: str, progress_path: str) -> None:
-    """单个 worker：对分到的每个根候选着法跑 df-pn，增量写入 .bin。"""
+    """单个 worker：对分到的每个根候选着法跑 df-pn，最终输出排序去重的 .bin。"""
     board = Board(BOARD_SIZE)
     board.grid = list(board_grid)
     board.last_capture = last_capture
     board.rebuild_zh()
 
     os.makedirs(os.path.dirname(bin_path) or ".", exist_ok=True)
-    f = open(bin_path, "wb")
-    _write_header(f, status=0)  # running
+    # 增量 append 文件（运行中崩溃安全）
+    tmp_path = bin_path + ".tmp"
+    f = open(tmp_path, "wb")
+    _write_header(f, status=0)
 
     total_nodes = 0
     t0 = time.monotonic()
     BATCH = 10_000
-    child_results = []  # [(move_str, pn, dn, nodes)]
+    child_results = []
+    all_tt: Dict[tuple, Tuple[int, int]] = {}  # 跨 move 的合并 TT
 
     for mx, my in my_moves:
         u = board.play_undoable(mx, my, first_turn)
@@ -219,7 +283,7 @@ def _worker_solve(board_grid: List[int], last_capture: int,
             info["total_nodes"] = total_nodes + info["nodes"]
             info["current_move"] = [mx, my]
             info["tt_flushed"] = last_flush
-            info["tt_size"] = len(solver.tt)
+            info["tt_size"] = len(solver.tt) + len(all_tt)
             try:
                 with open(progress_path, "w") as pf:
                     json.dump(info, pf)
@@ -236,18 +300,19 @@ def _worker_solve(board_grid: List[int], last_capture: int,
         r = solver.solve(-first_turn)
         total_nodes += r["nodes"]
 
-        # flush 剩余
         _flush_records(f, solver, last_flush)
         child_results.append((f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
+        # 合并到 all_tt（去重）
+        all_tt.update(solver.tt)
         board.undo(u)
 
     f.close()
 
-    # 写 child_results 到 JSON（供 coordinator 合并时计算根 pn/dn）
-    results_path = bin_path + ".results.json"
+    # 最终输出：排序去重的 .bin（覆盖 tmp）
+    _dump_sorted_bin(bin_path, all_tt, child_results)
+    # 删除 tmp
     try:
-        with open(results_path, "w") as rf:
-            json.dump(child_results, rf)
+        os.remove(tmp_path)
     except OSError:
         pass
 
@@ -296,20 +361,25 @@ def _aggregate_progress(workers: List[dict], progress_path: str,
 
 
 # ============================================================
-# 合并 worker .bin 文件
+# k-way 归并排序合并 worker .bin
 # ============================================================
+
+def _iter_records(path: str):
+    """流式读取已排序 .bin 的记录，yield 12 字节 bytes。"""
+    with open(path, "rb") as f:
+        f.seek(_HEADER_SIZE)
+        while True:
+            rec = f.read(_RECORD_SIZE)
+            if len(rec) < _RECORD_SIZE:
+                break
+            yield rec
+
 
 def _merge_worker_bins(workers: List[dict], main_bin_path: str,
                        attacker_color: int, first_turn: int) -> None:
-    """读所有 worker .bin → dict 去重 → 写主 .bin + header。"""
-    merged_tt: Dict[tuple, Tuple[int, int]] = {}
+    """k-way 归并已排序的 worker .bin → 排序的主 .bin。流式，内存 ~0。"""
     child_results = []
-
     for w in workers:
-        # 读 TT records（后覆盖前，自动去重）
-        wtt = _read_records(w["bin"])
-        merged_tt.update(wtt)
-        # 读 child results
         results_path = w["bin"] + ".results.json"
         try:
             with open(results_path) as rf:
@@ -333,21 +403,26 @@ def _merge_worker_bins(workers: List[dict], main_bin_path: str,
     result_str = "ATTACKER_WINS" if root_pn == 0 else (
         "DEFENDER_WINS" if root_dn == 0 else "UNPROVEN")
 
-    # 写主 .bin
+    # k-way 归并（各 worker .bin 已排序，key 不重叠）
+    iters = [_iter_records(w["bin"]) for w in workers if os.path.exists(w["bin"])]
     os.makedirs(os.path.dirname(main_bin_path) or ".", exist_ok=True)
     with open(main_bin_path, "wb") as f:
         _write_header(f, status=1, result=_RESULT_MAP.get(result_str, 0),
-                      count=len(merged_tt), root_pn=min(root_pn, 0xFFFFFFFF),
+                      count=0, root_pn=min(root_pn, 0xFFFFFFFF),
                       root_dn=min(root_dn, 0xFFFFFFFF))
-        for key, (pn, dn) in merged_tt.items():
-            zh, turn, lc = key
-            f.write(struct.pack(_RECORD_FMT,
-                                zh, turn, lc if lc >= 0 else 255,
-                                _encode_pn(pn), _encode_pn(dn)))
+        count = 0
+        for rec in heapq.merge(*iters):
+            f.write(rec)
+            count += 1
+        # 回写 count
+        f.seek(0)
+        _write_header(f, status=1, result=_RESULT_MAP.get(result_str, 0),
+                      count=count, root_pn=min(root_pn, 0xFFFFFFFF),
+                      root_dn=min(root_dn, 0xFFFFFFFF))
 
     # 清理 worker 临时文件
     for w in workers:
-        for path in (w["bin"], w["bin"] + ".results.json", w["progress"]):
+        for path in (w["bin"], w["bin"] + ".tmp", w["bin"] + ".results.json", w["progress"]):
             try:
                 os.remove(path)
             except OSError:
@@ -374,7 +449,6 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     board.last_capture = last_capture
     board.rebuild_zh()
 
-    # 生成根候选
     tmp_solver = DfpnSolver(
         board, region, attacker_color=attacker_color,
         kill_targets=[tuple(c) for c in kill_targets],
@@ -415,7 +489,6 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     for i, (_, move) in enumerate(sorted_moves):
         buckets[i % num_workers].append(move)
 
-    # 启动 workers
     cache_dir = os.path.dirname(bin_path) or "."
     job_id = os.path.splitext(os.path.basename(bin_path))[0]
     workers = []
@@ -433,7 +506,6 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
         p.start()
         workers.append({"process": p, "bin": wbin, "progress": wprog})
 
-    # 写 worker PID 文件
     pids_path = os.path.join(cache_dir, f"{job_id}_pids.json")
     try:
         with open(pids_path, "w") as f:
@@ -441,28 +513,24 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     except OSError:
         pass
 
-    # 等待
     while any(w["process"].is_alive() for w in workers):
         _aggregate_progress(workers, progress_path, start_time)
         time.sleep(2)
     _aggregate_progress(workers, progress_path, start_time)
 
-    # 合并
     _merge_worker_bins(workers, bin_path, attacker_color, first_turn)
 
-    # 清理 pids 文件
     try:
         os.remove(pids_path)
     except OSError:
         pass
 
-    # 最终进度
     with open(progress_path, "w") as f:
         json.dump({"status": "done", "total_nodes": 0, "message": "merged"}, f)
 
 
 # ============================================================
-# CLI 入口（供 subprocess 调用，确保用 pypy3 运行）
+# CLI 入口
 # ============================================================
 
 if __name__ == "__main__":
