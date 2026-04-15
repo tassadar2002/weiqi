@@ -10,6 +10,8 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -20,8 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from precompute import (load_tt_from_sqlite, run_precompute_parallel,
-                        solve_from_cache)
+from precompute import load_tt_from_sqlite, solve_from_cache
 from problems import (create_problem, delete_problem, get_problem, init_db,
                        list_problems, update_problem)
 from target import validate_target_stone
@@ -35,6 +36,10 @@ CACHE_DIR = os.path.join(PROJECT_ROOT, "backend", "cache")
 os.makedirs(os.path.join(PROJECT_ROOT, "backend", "data"), exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 init_db(PROBLEMS_DB)
+
+# 预处理用 pypy3（优先），否则回退当前解释器
+_PYPY3 = shutil.which("pypy3")
+_PRECOMPUTE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "precompute.py")
 
 # 预处理任务
 _JOBS: Dict[str, dict] = {}
@@ -296,14 +301,28 @@ class Handler(BaseHTTPRequestHandler):
         job_id = uuid.uuid4().hex[:12]
         db_path = os.path.join(CACHE_DIR, f"{job_id}.db")
         progress_path = os.path.join(CACHE_DIR, f"{job_id}_progress.json")
-        p = multiprocessing.Process(target=run_precompute_parallel, args=(
-            data["board"], data.get("last_capture", -1),
-            data["region"], data["kill_targets"], data["defend_targets"],
-            int(data["attacker_color"]), int(data.get("turn", 1)),
-            db_path, progress_path, None,
-        ))
-        p.start()
-        _JOBS[job_id] = {"process": p, "db_path": db_path, "progress_path": progress_path}
+        # 写配置文件，用 subprocess 启动 pypy3
+        config_path = os.path.join(CACHE_DIR, f"{job_id}_config.json")
+        with open(config_path, "w") as f:
+            json.dump({
+                "board": data["board"],
+                "last_capture": data.get("last_capture", -1),
+                "region": data["region"],
+                "kill_targets": data["kill_targets"],
+                "defend_targets": data["defend_targets"],
+                "attacker_color": int(data["attacker_color"]),
+                "turn": int(data.get("turn", 1)),
+                "db_path": db_path,
+                "progress_path": progress_path,
+                "num_workers": None,
+            }, f)
+        interpreter = _PYPY3 or sys.executable
+        p = subprocess.Popen(
+            [interpreter, _PRECOMPUTE_SCRIPT, config_path],
+            cwd=os.path.dirname(_PRECOMPUTE_SCRIPT),
+        )
+        _JOBS[job_id] = {"process": p, "db_path": db_path,
+                         "progress_path": progress_path, "config_path": config_path}
         # 关联到习题
         if "problem_id" in data:
             update_problem(PROBLEMS_DB, data["problem_id"],
@@ -320,7 +339,9 @@ class Handler(BaseHTTPRequestHandler):
                 progress = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             progress = {"status": "starting", "total_nodes": 0}
-        if not job["process"].is_alive() and progress.get("status") not in ("done", "merging"):
+        proc = job["process"]
+        is_alive = proc.poll() is None  # subprocess.Popen: poll() returns None if running
+        if not is_alive and progress.get("status") not in ("done", "merging"):
             progress["status"] = "done" if os.path.exists(job["db_path"]) else "crashed"
         # 检查 DB 是否已合并完成
         if progress.get("status") in ("done", "merging") and os.path.exists(job["db_path"]):
@@ -355,10 +376,14 @@ class Handler(BaseHTTPRequestHandler):
                         pass
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 pass
-            # 再杀 coordinator
-            if job["process"].is_alive():
-                job["process"].terminate()
-                job["process"].join(timeout=5)
+            # 再杀 coordinator（subprocess.Popen）
+            proc = job["process"]
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         if "problem_id" in data:
             update_problem(PROBLEMS_DB, data["problem_id"], precompute_status="none")
         self._json(200, {"ok": True})

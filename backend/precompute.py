@@ -24,15 +24,25 @@ from solver import DfpnSolver
 def _init_db(db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     db = sqlite3.connect(db_path)
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
-    db.execute("CREATE TABLE IF NOT EXISTS tt (key TEXT PRIMARY KEY, pn INTEGER, dn INTEGER)")
+    _exec(db, "PRAGMA journal_mode=WAL")
+    _exec(db, "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    _exec(db, "CREATE TABLE IF NOT EXISTS tt (key TEXT PRIMARY KEY, pn INTEGER, dn INTEGER)")
     db.commit()
     return db
 
 
+def _exec(db: sqlite3.Connection, sql: str, params=None) -> None:
+    """执行 SQL 并立即关闭 cursor（兼容 PyPy sqlite3）。"""
+    cur = db.cursor()
+    if params:
+        cur.execute(sql, params)
+    else:
+        cur.execute(sql)
+    cur.close()
+
+
 def _set_meta(db: sqlite3.Connection, key: str, value: str) -> None:
-    db.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value))
+    _exec(db, "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value))
 
 
 def _get_meta(db: sqlite3.Connection, key: str) -> Optional[str]:
@@ -45,8 +55,10 @@ def _flush_tt_from_log(db: sqlite3.Connection, solver, already_flushed: int) -> 
     new_keys = solver.tt_log[already_flushed:]
     if new_keys:
         tt = solver.tt
-        db.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)",
-                       [(_tt_key_to_str(k), tt[k][0], tt[k][1]) for k in new_keys])
+        cur = db.cursor()
+        cur.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)",
+                        [(_tt_key_to_str(k), tt[k][0], tt[k][1]) for k in new_keys])
+        cur.close()
 
 
 def _tt_key_to_str(key) -> str:
@@ -59,7 +71,9 @@ def _tt_key_to_str(key) -> str:
 def load_tt_from_sqlite(db_path: str) -> Dict:
     """从 SQLite 加载全部 TT 到内存 dict。key 为 "zh|turn|lc" 字符串。"""
     db = sqlite3.connect(db_path)
-    rows = db.execute("SELECT key, pn, dn FROM tt").fetchall()
+    cur = db.cursor()
+    rows = cur.execute("SELECT key, pn, dn FROM tt").fetchall()
+    cur.close()
     db.close()
     # 转为 tuple key 以匹配 solver 的 _tt_key 格式
     tt = {}
@@ -150,8 +164,8 @@ def _worker_solve(board_grid: List[int], last_capture: int,
     board.last_capture = last_capture
 
     db = _init_db(db_path)
-    db.execute("CREATE TABLE IF NOT EXISTS results "
-               "(move TEXT PRIMARY KEY, pn INTEGER, dn INTEGER, nodes INTEGER)")
+    _exec(db, "CREATE TABLE IF NOT EXISTS results "
+          "(move TEXT PRIMARY KEY, pn INTEGER, dn INTEGER, nodes INTEGER)")
     db.commit()
 
     total_nodes = 0
@@ -195,8 +209,8 @@ def _worker_solve(board_grid: List[int], last_capture: int,
 
         # flush 剩余
         _flush_tt_from_log(db, solver, last_flush)
-        db.execute("INSERT OR REPLACE INTO results (move, pn, dn, nodes) VALUES (?, ?, ?, ?)",
-                   (f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
+        _exec(db, "INSERT OR REPLACE INTO results (move, pn, dn, nodes) VALUES (?, ?, ?, ?)",
+              (f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
         db.commit()
         board.undo(u)
 
@@ -257,10 +271,16 @@ def _merge_worker_dbs(workers: List[dict], main_db_path: str,
         if not os.path.exists(w["db"]):
             continue
         wdb = sqlite3.connect(w["db"])
-        rows = wdb.execute("SELECT key, pn, dn FROM tt").fetchall()
+        cur = wdb.cursor()
+        rows = cur.execute("SELECT key, pn, dn FROM tt").fetchall()
+        cur.close()
         if rows:
-            main_db.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)", rows)
-        results = wdb.execute("SELECT move, pn, dn FROM results").fetchall()
+            mc = main_db.cursor()
+            mc.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)", rows)
+            mc.close()
+        cur2 = wdb.cursor()
+        results = cur2.execute("SELECT move, pn, dn FROM results").fetchall()
+        cur2.close()
         child_results.extend(results)
         wdb.close()
     main_db.commit()
@@ -284,7 +304,9 @@ def _merge_worker_dbs(workers: List[dict], main_db_path: str,
     _set_meta(main_db, "result", result_str)
     _set_meta(main_db, "root_pn", str(root_pn))
     _set_meta(main_db, "root_dn", str(root_dn))
-    total_tt = main_db.execute("SELECT COUNT(*) FROM tt").fetchone()[0]
+    cur3 = main_db.cursor()
+    total_tt = cur3.execute("SELECT COUNT(*) FROM tt").fetchone()[0]
+    cur3.close()
     _set_meta(main_db, "tt_size", str(total_tt))
     main_db.commit()
     main_db.close()
@@ -393,3 +415,23 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     with open(progress_path, "w") as f:
         json.dump({"status": "done", "total_nodes": 0,
                    "message": "merged"}, f)
+
+
+# ============================================================
+# CLI 入口（供 subprocess 调用，确保用 pypy3 运行）
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: pypy3 precompute.py <config.json>", file=sys.stderr)
+        sys.exit(1)
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    run_precompute_parallel(
+        cfg["board"], cfg["last_capture"], cfg["region"],
+        cfg["kill_targets"], cfg["defend_targets"],
+        cfg["attacker_color"], cfg["turn"],
+        cfg["db_path"], cfg["progress_path"],
+        cfg.get("num_workers"),
+    )
