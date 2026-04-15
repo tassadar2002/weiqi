@@ -51,6 +51,7 @@ class DfpnSolver:
         self.nodes = 0
         self.start_time = 0.0
         self._initial_turn = 0  # 记录 solve() 传入的 turn，供 progress 查根
+        self._killers: List[List[Tuple[int, int]]] = [[] for _ in range(max_depth + 1)]
 
     # ---- TT ----
 
@@ -88,11 +89,12 @@ class DfpnSolver:
 
     # ---- 走法生成（提子优先排序）----
 
-    def _gen_children(self, turn: int, allow_pass: bool) -> List[Tuple[Optional[Tuple[int, int]], int]]:
+    def _gen_children(self, turn: int, allow_pass: bool, depth: int = 0) -> List[Tuple[Optional[Tuple[int, int]], int]]:
         board = self.board
         size = board.size
         grid = board.grid
         region = self.region_mask
+        killer_set = set(self._killers[depth]) if depth < len(self._killers) else set()
         kids: List[Tuple[Optional[Tuple[int, int]], int]] = []
         for y in range(size):
             for x in range(size):
@@ -106,12 +108,25 @@ class DfpnSolver:
                 for nx, ny in board.neighbors(x, y):
                     if grid[ny * size + nx] != EMPTY:
                         score += 5
+                if (x, y) in killer_set:
+                    score += 50000
                 board.undo(u)
                 kids.append(((x, y), score))
         kids.sort(key=lambda k: -k[1])
         if allow_pass:
             kids.append((None, -1))
         return kids
+
+    def _record_killer(self, depth: int, move: Tuple[int, int]) -> None:
+        """记录 killer 着法，每深度保留最近 2 个。"""
+        if depth >= len(self._killers):
+            return
+        killers = self._killers[depth]
+        if move in killers:
+            return
+        killers.insert(0, move)
+        if len(killers) > 2:
+            killers.pop()
 
     # ---- play/undo helpers ----
 
@@ -168,7 +183,7 @@ class DfpnSolver:
             self._tt_set(turn, DFPN_INF, 0)
             return
         is_or = (turn == self.attacker_color)
-        kids = self._gen_children(turn, allow_pass=not is_or)
+        kids = self._gen_children(turn, allow_pass=not is_or, depth=depth)
         if not kids:
             self._tt_set(turn, DFPN_INF, 0)
             return
@@ -179,7 +194,10 @@ class DfpnSolver:
             pn, dn, best_idx, second_best, best_child_pn, best_child_dn = \
                 self._aggregate(kids, turn, is_or)
             self._tt_set(turn, pn, dn)
-            if pn == 0 or dn == 0: return
+            if pn == 0 or dn == 0:
+                if best_idx >= 0 and kids[best_idx][0] is not None:
+                    self._record_killer(depth, kids[best_idx][0])
+                return
             if pn >= th_pn or dn >= th_dn: return
 
             if is_or:
