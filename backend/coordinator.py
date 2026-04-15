@@ -249,9 +249,31 @@ class Coordinator:
         except OSError:
             pass
 
+    def _collect_worker_snapshots(self) -> List[dict]:
+        """收集各 worker 的最终状态快照。"""
+        snapshots = []
+        for i, wp in enumerate(self.worker_progress):
+            snap = {"worker": i, "pid": None, "status": "unknown",
+                    "total_nodes": 0, "tasks_done": 0, "elapsed_ms": 0}
+            try:
+                with open(wp) as f:
+                    wd = json.load(f)
+                snap.update({
+                    "pid": wd.get("pid"),
+                    "status": wd.get("status", "unknown"),
+                    "total_nodes": wd.get("total_nodes", 0),
+                    "tasks_done": wd.get("tasks_done", 0),
+                    "elapsed_ms": wd.get("elapsed_ms", 0),
+                })
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                pass
+            snapshots.append(snap)
+        return snapshots
+
     def _write_final_progress(self) -> None:
         elapsed_ms = int((time.monotonic() - self.start_time) * 1000)
         total_nodes = sum(v[3] for v in self.all_results.values())
+        workers = self._collect_worker_snapshots()
         with open(self.progress_path, "w") as f:
             json.dump({
                 "status": "done",
@@ -260,6 +282,7 @@ class Coordinator:
                 "message": "merged",
                 "done_moves": len(self.all_results),
                 "total_moves": len(self.root_moves),
+                "workers": workers,
             }, f)
 
     # ── 主入口 ──
@@ -286,8 +309,8 @@ class Coordinator:
         self._shutdown_workers()
 
         self._merge_bins()
+        self._write_final_progress()  # 先写（读 worker 文件），再清理
         self._cleanup(pids_path)
-        self._write_final_progress()
 
 
 # ── CLI 入口 ──

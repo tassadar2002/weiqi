@@ -123,7 +123,13 @@ def cli_status(problem_id: str):
             print(f"活跃进程: {wa}")
 
     # ---- worker 明细 ----
-    # 扫描 worker progress 文件
+    # 优先从主 progress.json 的 workers 快照读取（完成后 worker 文件已清理）
+    worker_data = (prog or {}).get("workers")
+    if worker_data:
+        _print_worker_table(worker_data)
+        return
+
+    # 运行中：扫描 worker progress 文件
     pattern = os.path.join(_CACHE_DIR, f"{job_id}_worker*_progress.json")
     wpaths = sorted(_glob.glob(pattern))
     if not wpaths:
