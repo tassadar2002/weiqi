@@ -92,12 +92,19 @@ class DfpnSolver:
         return None
 
     # ---- 走法生成（提子优先排序）----
+    #
+    # 快速路径：有空邻（不自杀）+ 对手邻群气>=2（不提子）+ 非 ko
+    #   → 确认合法，跳过 play_undoable/undo
+    # 慢速路径：紧气/提子/ko → 完整 play_undoable 检查
 
     def _gen_children(self, turn: int, allow_pass: bool, depth: int = 0) -> List[Tuple[Optional[Tuple[int, int]], int]]:
         board = self.board
         size = board.size
         grid = board.grid
         region = self.region_mask
+        opp = -turn
+        prev_lc = board.last_capture
+        sz_m1 = size - 1
         killer_set = set(self._killers[depth]) if depth < len(self._killers) else set()
         kids: List[Tuple[Optional[Tuple[int, int]], int]] = []
         for y in range(size):
@@ -105,17 +112,59 @@ class DfpnSolver:
                 idx = y * size + x
                 if not region[idx] or grid[idx] != EMPTY:
                     continue
-                u = board.play_undoable(x, y, turn)
-                if u is None:
-                    continue
-                score = len(u.captured) * 10000
-                for nx, ny in board.neighbors(x, y):
-                    if grid[ny * size + nx] != EMPTY:
-                        score += 5
+
+                # ── 扫描 4 邻 ──
+                has_empty = False
+                adj_score = 0
+                might_capture = False
+                if y > 0:
+                    nc = grid[idx - size]
+                    if nc == EMPTY:
+                        has_empty = True
+                    else:
+                        adj_score += 5
+                        if nc == opp and not might_capture and board.count_libs_fast(x, y - 1, 2) <= 1:
+                            might_capture = True
+                if y < sz_m1:
+                    nc = grid[idx + size]
+                    if nc == EMPTY:
+                        has_empty = True
+                    else:
+                        adj_score += 5
+                        if nc == opp and not might_capture and board.count_libs_fast(x, y + 1, 2) <= 1:
+                            might_capture = True
+                if x > 0:
+                    nc = grid[idx - 1]
+                    if nc == EMPTY:
+                        has_empty = True
+                    else:
+                        adj_score += 5
+                        if nc == opp and not might_capture and board.count_libs_fast(x - 1, y, 2) <= 1:
+                            might_capture = True
+                if x < sz_m1:
+                    nc = grid[idx + 1]
+                    if nc == EMPTY:
+                        has_empty = True
+                    else:
+                        adj_score += 5
+                        if nc == opp and not might_capture and board.count_libs_fast(x + 1, y, 2) <= 1:
+                            might_capture = True
+
+                # ── 判定合法性 + 计分 ──
+                if has_empty and not might_capture and prev_lc != idx:
+                    # 快速路径：一定合法，无提子
+                    score = adj_score
+                else:
+                    # 慢速路径：完整检查
+                    u = board.play_undoable(x, y, turn)
+                    if u is None:
+                        continue
+                    score = len(u.captured) * 10000 + adj_score
+                    board.undo(u)
                 if (x, y) in killer_set:
                     score += 50000
-                board.undo(u)
                 kids.append(((x, y), score))
+
         kids.sort(key=lambda k: -k[1])
         if allow_pass:
             kids.append((None, -1))
