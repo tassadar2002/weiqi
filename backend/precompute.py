@@ -31,6 +31,78 @@ DEFAULT_BUDGET = 5_000_000
 # 无状态 Worker
 # ============================================================
 
+def _ensure_recursion_limit():
+    import sys as _sys
+    needed = 80 * 3 + 200
+    if _sys.getrecursionlimit() < needed:
+        _sys.setrecursionlimit(needed)
+
+
+def _make_board(board_grid: List[int], last_capture: int) -> Board:
+    """从 grid 数组构造 Board（含 rebuild_zh）。"""
+    board = Board(BOARD_SIZE)
+    board.grid = list(board_grid)
+    board.last_capture = last_capture
+    board.rebuild_zh()
+    return board
+
+
+def _write_worker_progress(progress_path: str, status: str,
+                           total_nodes: int, tasks_done: int,
+                           pid: int, t0: float) -> None:
+    try:
+        with open(progress_path, "w") as pf:
+            json.dump({
+                "status": status,
+                "total_nodes": total_nodes,
+                "tasks_done": tasks_done,
+                "pid": pid,
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }, pf)
+    except OSError:
+        pass
+
+
+def _solve_one_task(task, board_grid, last_capture, region,
+                    kill_targets, defend_targets, attacker_color, first_turn,
+                    max_entries, budget, progress_path, total_nodes, pid):
+    """执行单个任务。返回 (result_dict, nodes_used) 或 None（非法着）。"""
+    root_move, bin_path = task
+    mx, my = root_move
+
+    board = _make_board(board_grid, last_capture)
+    u = board.play_undoable(mx, my, first_turn)
+    if u is None:
+        return None
+
+    disk_tt = DiskTT(bin_path, max_entries)
+
+    def on_progress(info):
+        info["status"] = "running"
+        info["total_nodes"] = total_nodes + info["nodes"]
+        info["current_move"] = [mx, my]
+        info["pid"] = pid
+        try:
+            with open(progress_path, "w") as pf:
+                json.dump(info, pf)
+        except OSError:
+            pass
+
+    solver = DfpnSolver(
+        board, region,
+        attacker_color=attacker_color,
+        kill_targets=[tuple(c) for c in kill_targets],
+        defend_targets=[tuple(c) for c in defend_targets],
+        max_nodes=budget,
+        progress_callback=on_progress,
+        tt=disk_tt,
+    )
+    r = solver.solve(-first_turn)
+    disk_tt.close()
+    board.undo(u)
+    return r
+
+
 def _worker_loop(task_queue: mp.Queue, result_queue: mp.Queue,
                  heartbeat_queue: mp.Queue,
                  board_grid: List[int], last_capture: int,
@@ -40,11 +112,7 @@ def _worker_loop(task_queue: mp.Queue, result_queue: mp.Queue,
                  max_entries: int, budget: int,
                  progress_path: str) -> None:
     """无状态 worker：循环取任务、执行、放回或汇报结果。"""
-    import sys as _sys
-    needed = 80 * 3 + 200
-    if _sys.getrecursionlimit() < needed:
-        _sys.setrecursionlimit(needed)
-
+    _ensure_recursion_limit()
     pid = os.getpid()
     total_nodes = 0
     tasks_done = 0
@@ -52,87 +120,37 @@ def _worker_loop(task_queue: mp.Queue, result_queue: mp.Queue,
 
     while True:
         task = task_queue.get()
-        if task is None:  # poison pill → 退出
+        if task is None:
             break
 
-        root_move, bin_path = task
-        mx, my = root_move
+        root_move = task[0]
         heartbeat_queue.put(("start", root_move, pid))
 
-        board = Board(BOARD_SIZE)
-        board.grid = list(board_grid)
-        board.last_capture = last_capture
-        board.rebuild_zh()
+        r = _solve_one_task(task, board_grid, last_capture, region,
+                            kill_targets, defend_targets, attacker_color,
+                            first_turn, max_entries, budget,
+                            progress_path, total_nodes, pid)
 
-        u = board.play_undoable(mx, my, first_turn)
-        if u is None:
+        if r is None:
             result_queue.put((root_move, "ILLEGAL", 0, 0, 0))
             heartbeat_queue.put(("done", root_move, pid))
             continue
 
-        disk_tt = DiskTT(bin_path, max_entries)
-
-        def on_progress(info):
-            info["status"] = "running"
-            info["total_nodes"] = total_nodes + info["nodes"]
-            info["current_move"] = [mx, my]
-            info["pid"] = pid
-            try:
-                with open(progress_path, "w") as pf:
-                    json.dump(info, pf)
-            except OSError:
-                pass
-
-        solver = DfpnSolver(
-            board, region,
-            attacker_color=attacker_color,
-            kill_targets=[tuple(c) for c in kill_targets],
-            defend_targets=[tuple(c) for c in defend_targets],
-            max_nodes=budget,
-            progress_callback=on_progress,
-            tt=disk_tt,
-        )
-        r = solver.solve(-first_turn)
         total_nodes += r["nodes"]
         tasks_done += 1
 
-        disk_tt.close()
-        board.undo(u)
-
         if r["result"] == "UNPROVEN":
-            # 未证明 → 放回队列
             task_queue.put(task)
             heartbeat_queue.put(("requeue", root_move, pid))
         else:
-            # 已证明 → 汇报
             result_queue.put((root_move, r["result"], r["pn"], r["dn"], r["nodes"]))
             heartbeat_queue.put(("done", root_move, pid))
 
-        # 更新 worker 进度
-        try:
-            with open(progress_path, "w") as pf:
-                json.dump({
-                    "status": "running",
-                    "total_nodes": total_nodes,
-                    "tasks_done": tasks_done,
-                    "pid": pid,
-                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
-                }, pf)
-        except OSError:
-            pass
+        _write_worker_progress(progress_path, "running",
+                               total_nodes, tasks_done, pid, t0)
 
-    # Worker 退出
-    try:
-        with open(progress_path, "w") as pf:
-            json.dump({
-                "status": "done",
-                "total_nodes": total_nodes,
-                "tasks_done": tasks_done,
-                "pid": pid,
-                "elapsed_ms": int((time.monotonic() - t0) * 1000),
-            }, pf)
-    except OSError:
-        pass
+    _write_worker_progress(progress_path, "done",
+                           total_nodes, tasks_done, pid, t0)
 
 
 # ============================================================
