@@ -137,6 +137,49 @@ class Board:
 
         return group, libs
 
+    def count_libs_fast(self, x: int, y: int, max_libs: int = 2) -> int:
+        """快速气数检查。不收集 group 列表，达到 max_libs 时提前返回。"""
+        size = self.size
+        grid = self.grid
+        i0 = y * size + x
+        color = grid[i0]
+        if color == EMPTY:
+            return 0
+
+        visited = self._visited
+        lib_count = 0
+        touched = [i0]
+        stack = [i0]
+        visited[i0] = 1
+        sz_m1 = size - 1
+
+        while stack:
+            pos = stack.pop()
+            py, px = divmod(pos, size)
+            for ni in (
+                pos - size if py > 0 else -1,
+                pos + size if py < sz_m1 else -1,
+                pos - 1 if px > 0 else -1,
+                pos + 1 if px < sz_m1 else -1,
+            ):
+                if ni < 0 or visited[ni]:
+                    continue
+                visited[ni] = 1
+                touched.append(ni)
+                s = grid[ni]
+                if s == color:
+                    stack.append(ni)
+                elif s == EMPTY:
+                    lib_count += 1
+                    if lib_count >= max_libs:
+                        for p in touched:
+                            visited[p] = 0
+                        return lib_count
+
+        for p in touched:
+            visited[p] = 0
+        return lib_count
+
     # ---- 撤销式落子 ----
 
     def play_undoable(self, x: int, y: int, color: int) -> Optional[UndoInfo]:
@@ -156,43 +199,38 @@ class Board:
         captured: List[Tuple[int, int, int]] = []
         sz_m1 = size - 1
 
-        # 4 邻提子检测
-        if y > 0 and grid[i - size] == opp:
-            group, libs = self.group_and_libs(x, y - 1)
-            if len(libs) == 0:
-                for gx, gy in group:
-                    gi = gy * size + gx
-                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
-                    grid[gi] = EMPTY
-                    captured.append((gx, gy, opp))
-        if y < sz_m1 and grid[i + size] == opp:
-            group, libs = self.group_and_libs(x, y + 1)
-            if len(libs) == 0:
-                for gx, gy in group:
-                    gi = gy * size + gx
-                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
-                    grid[gi] = EMPTY
-                    captured.append((gx, gy, opp))
-        if x > 0 and grid[i - 1] == opp:
-            group, libs = self.group_and_libs(x - 1, y)
-            if len(libs) == 0:
-                for gx, gy in group:
-                    gi = gy * size + gx
-                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
-                    grid[gi] = EMPTY
-                    captured.append((gx, gy, opp))
-        if x < sz_m1 and grid[i + 1] == opp:
-            group, libs = self.group_and_libs(x + 1, y)
-            if len(libs) == 0:
-                for gx, gy in group:
-                    gi = gy * size + gx
-                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
-                    grid[gi] = EMPTY
-                    captured.append((gx, gy, opp))
+        # 4 邻提子检测（先快速气检，仅气=0 时才取完整 group）
+        if y > 0 and grid[i - size] == opp and self.count_libs_fast(x, y - 1, 1) == 0:
+            group, _ = self.group_and_libs(x, y - 1)
+            for gx, gy in group:
+                gi = gy * size + gx
+                self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                grid[gi] = EMPTY
+                captured.append((gx, gy, opp))
+        if y < sz_m1 and grid[i + size] == opp and self.count_libs_fast(x, y + 1, 1) == 0:
+            group, _ = self.group_and_libs(x, y + 1)
+            for gx, gy in group:
+                gi = gy * size + gx
+                self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                grid[gi] = EMPTY
+                captured.append((gx, gy, opp))
+        if x > 0 and grid[i - 1] == opp and self.count_libs_fast(x - 1, y, 1) == 0:
+            group, _ = self.group_and_libs(x - 1, y)
+            for gx, gy in group:
+                gi = gy * size + gx
+                self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                grid[gi] = EMPTY
+                captured.append((gx, gy, opp))
+        if x < sz_m1 and grid[i + 1] == opp and self.count_libs_fast(x + 1, y, 1) == 0:
+            group, _ = self.group_and_libs(x + 1, y)
+            for gx, gy in group:
+                gi = gy * size + gx
+                self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                grid[gi] = EMPTY
+                captured.append((gx, gy, opp))
 
-        # 自杀检测
-        _, own_libs = self.group_and_libs(x, y)
-        if len(own_libs) == 0:
+        # 自杀检测（快速气检）
+        if self.count_libs_fast(x, y, 1) == 0:
             for gx, gy, c in reversed(captured):
                 grid[gy * size + gx] = c
             grid[i] = EMPTY
