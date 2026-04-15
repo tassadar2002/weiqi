@@ -35,7 +35,8 @@ class DfpnSolver:
                  max_nodes: int = 10**18,
                  max_time_ms: int = 10**18,
                  max_depth: int = 80,
-                 progress_callback: Optional[Callable] = None):
+                 progress_callback: Optional[Callable] = None,
+                 tt=None):
         self.board = board
         self.region_mask = region_mask
         self.attacker_color = attacker_color
@@ -47,11 +48,13 @@ class DfpnSolver:
         self.max_depth = max_depth
         self.progress_callback = progress_callback
 
-        self.tt: Dict[tuple, Tuple[int, int]] = {}
-        self.tt_log: List[tuple] = []  # 新增 key 的有序列表（用于增量 flush）
+        # TT：支持外部传入（DiskTT）或默认内部 dict
+        self._external_tt = tt is not None
+        self.tt = tt if tt is not None else {}
+        self.tt_log: List[tuple] = []  # 仅内部 dict 使用
         self.nodes = 0
         self.start_time = 0.0
-        self._initial_turn = 0  # 记录 solve() 传入的 turn，供 progress 查根
+        self._initial_turn = 0
         self._killers: List[List[Tuple[int, int]]] = [[] for _ in range(max_depth + 1)]
 
     # ---- TT ----
@@ -60,13 +63,18 @@ class DfpnSolver:
         return (self.board.zh, turn, self.board.last_capture)
 
     def _tt_get(self, turn: int) -> Tuple[int, int]:
+        if self._external_tt:
+            return self.tt.get(self._tt_key(turn))
         return self.tt.get(self._tt_key(turn), (1, 1))
 
     def _tt_set(self, turn: int, pn: int, dn: int) -> None:
         key = self._tt_key(turn)
-        if key not in self.tt:
-            self.tt_log.append(key)
-        self.tt[key] = (pn, dn)
+        if self._external_tt:
+            self.tt.set(key, pn, dn)
+        else:
+            if key not in self.tt:
+                self.tt_log.append(key)
+            self.tt[key] = (pn, dn)
 
     # ---- 终止判定（多目标）----
 
@@ -210,12 +218,12 @@ class DfpnSolver:
             if elapsed > self.max_time_ms:
                 raise _Timeout()
             if self.progress_callback:
-                root_pn, root_dn = self.tt.get(
-                    self._tt_key(self._initial_turn), (1, 1))
+                root_pn, root_dn = self._tt_get(self._initial_turn)
+                tt_size = self.tt.tt_size() if self._external_tt else len(self.tt)
                 self.progress_callback({
                     "nodes": self.nodes,
                     "elapsed_ms": int(elapsed),
-                    "tt_size": len(self.tt),
+                    "tt_size": tt_size,
                     "root_pn": root_pn,
                     "root_dn": root_dn,
                 })

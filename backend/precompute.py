@@ -1,185 +1,136 @@
 """
-预处理系统 — 多进程并行穷举 df-pn
+预处理系统 — 小任务 + 任务队列
 
-- run_precompute_parallel: coordinator 入口（生成根候选 → 分配 worker → 监控 → 合并）
-- _worker_solve: 单 worker 求解逻辑（支持断点续传）
+架构：
+  - Coordinator: 生成根候选 → 放入任务队列 → 事件循环（监控/崩溃恢复）→ 合并
+  - Worker: 无状态，循环取任务执行，未完成放回队列
+  - DiskTT: 内存缓冲 + 磁盘 mmap，内存可控
+
+每个任务 = 一个根着点 + 节点预算。Worker 用 DiskTT 执行 df-pn，
+预算用完未证明 → 放回队列（任何 worker 可续传）。
 """
 
 import heapq
 import json
-import logging
 import multiprocessing as mp
 import os
 import time
 from typing import Dict, List, Optional, Tuple
 
-from bincache import (DFPN_INF, _HEADER_SIZE, _RECORD_SIZE, _RESULT_MAP,
-                      _dump_sorted_bin, _flush_records, _iter_records,
-                      _merge_worker_bins, _read_header, _write_header)
+from bincache import (DFPN_INF, BinCache, DiskTT, _HEADER_SIZE, _RECORD_SIZE,
+                      _RESULT_MAP, _calc_max_tt_entries, _calc_num_workers,
+                      _iter_records, _pack_record, _read_header, _write_header)
 from board import BLACK, BOARD_SIZE, Board
 from solver import DfpnSolver
 
+# 默认每段节点预算
+DEFAULT_BUDGET = 5_000_000
+
+
 # ============================================================
-# 单 worker（支持断点续传）
+# 无状态 Worker
 # ============================================================
 
-def _worker_solve(board_grid: List[int], last_capture: int,
-                  region: List[int],
-                  kill_targets: List[List[int]], defend_targets: List[List[int]],
-                  attacker_color: int, first_turn: int,
-                  my_moves: List[Tuple[int, int]],
-                  bin_path: str, progress_path: str) -> None:
-    """单个 worker：对分到的每个根候选着法跑 df-pn，最终输出排序去重的 .bin。
-    支持断点续传：已完成的 move（_m{mi}.bin 存在且 status=1）自动跳过。"""
+def _worker_loop(task_queue: mp.Queue, result_queue: mp.Queue,
+                 heartbeat_queue: mp.Queue,
+                 board_grid: List[int], last_capture: int,
+                 region: List[int],
+                 kill_targets: List[List[int]], defend_targets: List[List[int]],
+                 attacker_color: int, first_turn: int,
+                 max_entries: int, budget: int,
+                 progress_path: str) -> None:
+    """无状态 worker：循环取任务、执行、放回或汇报结果。"""
     import sys as _sys
-
-    # 防递归溢出
     needed = 80 * 3 + 200
     if _sys.getrecursionlimit() < needed:
         _sys.setrecursionlimit(needed)
 
-    board = Board(BOARD_SIZE)
-    board.grid = list(board_grid)
-    board.last_capture = last_capture
-    board.rebuild_zh()
-
-    os.makedirs(os.path.dirname(bin_path) or ".", exist_ok=True)
-    cache_dir = os.path.dirname(bin_path) or "."
-    job_base = os.path.splitext(os.path.basename(bin_path))[0]
-
-    # 增量 append 文件（运行中崩溃安全）
-    tmp_path = bin_path + ".tmp"
-    f = open(tmp_path, "wb")
-    _write_header(f, status=0)
-
+    pid = os.getpid()
     total_nodes = 0
-    total_tt_count = 0
+    tasks_done = 0
     t0 = time.monotonic()
-    BATCH = 10_000
-    child_results = []
-    move_bins = []
 
-    try:
-        for mi, (mx, my) in enumerate(my_moves):
-            move_bin = os.path.join(cache_dir, f"{job_base}_m{mi}.bin")
-            results_file = move_bin + ".results.json"
+    while True:
+        task = task_queue.get()
+        if task is None:  # poison pill → 退出
+            break
 
-            # 断点续传：检查此 move 是否已完成
-            if os.path.exists(move_bin):
-                hdr = _read_header(move_bin)
-                if hdr and hdr["status"] == 1:
-                    move_bins.append(move_bin)
-                    total_tt_count += hdr["count"]
-                    # 恢复 child_results
-                    try:
-                        with open(results_file) as rf:
-                            for entry in json.load(rf):
-                                child_results.append(tuple(entry))
-                                if len(entry) >= 4:
-                                    total_nodes += entry[3]
-                    except (FileNotFoundError, json.JSONDecodeError, OSError):
-                        pass
-                    continue
+        root_move, bin_path = task
+        mx, my = root_move
+        heartbeat_queue.put(("start", root_move, pid))
 
-            u = board.play_undoable(mx, my, first_turn)
-            if u is None:
-                continue
+        board = Board(BOARD_SIZE)
+        board.grid = list(board_grid)
+        board.last_capture = last_capture
+        board.rebuild_zh()
 
-            last_flush = 0
+        u = board.play_undoable(mx, my, first_turn)
+        if u is None:
+            result_queue.put((root_move, "ILLEGAL", 0, 0, 0))
+            heartbeat_queue.put(("done", root_move, pid))
+            continue
 
-            def on_progress(info):
-                nonlocal last_flush
-                new_count = len(solver.tt_log)
-                if new_count - last_flush >= BATCH:
-                    last_flush = _flush_records(f, solver, last_flush)
-                info["status"] = "running"
-                info["total_nodes"] = total_nodes + info["nodes"]
-                info["current_move"] = [mx, my]
-                info["tt_flushed"] = last_flush
-                info["tt_size"] = total_tt_count + len(solver.tt)
-                try:
-                    with open(progress_path, "w") as pf:
-                        json.dump(info, pf)
-                except OSError:
-                    pass
+        disk_tt = DiskTT(bin_path, max_entries)
 
-            solver = DfpnSolver(
-                board, region,
-                attacker_color=attacker_color,
-                kill_targets=[tuple(c) for c in kill_targets],
-                defend_targets=[tuple(c) for c in defend_targets],
-                progress_callback=on_progress,
-            )
-            r = solver.solve(-first_turn)
-            total_nodes += r["nodes"]
+        def on_progress(info):
+            info["status"] = "running"
+            info["total_nodes"] = total_nodes + info["nodes"]
+            info["current_move"] = [mx, my]
+            info["pid"] = pid
+            try:
+                with open(progress_path, "w") as pf:
+                    json.dump(info, pf)
+            except OSError:
+                pass
 
-            _flush_records(f, solver, last_flush)
-            move_result = (f"{mx},{my}", r["pn"], r["dn"], r["nodes"])
-            child_results.append(move_result)
+        solver = DfpnSolver(
+            board, region,
+            attacker_color=attacker_color,
+            kill_targets=[tuple(c) for c in kill_targets],
+            defend_targets=[tuple(c) for c in defend_targets],
+            max_nodes=budget,
+            progress_callback=on_progress,
+            tt=disk_tt,
+        )
+        r = solver.solve(-first_turn)
+        total_nodes += r["nodes"]
+        tasks_done += 1
 
-            # 每个 move 完成后：排序写入独立 .bin + results.json（作为 checkpoint）
-            _dump_sorted_bin(move_bin, solver.tt, [move_result])
-            total_tt_count += len(solver.tt)
-            move_bins.append(move_bin)
-            del solver
+        disk_tt.close()
+        board.undo(u)
 
-            board.undo(u)
+        if r["result"] == "UNPROVEN":
+            # 未证明 → 放回队列
+            task_queue.put(task)
+            heartbeat_queue.put(("requeue", root_move, pid))
+        else:
+            # 已证明 → 汇报
+            result_queue.put((root_move, r["result"], r["pn"], r["dn"], r["nodes"]))
+            heartbeat_queue.put(("done", root_move, pid))
 
-    except Exception as e:
-        import traceback
+        # 更新 worker 进度
         try:
             with open(progress_path, "w") as pf:
-                json.dump({"status": "crashed", "total_nodes": total_nodes,
-                           "error": f"{type(e).__name__}: {e}",
-                           "traceback": traceback.format_exc(),
-                           "elapsed_ms": int((time.monotonic() - t0) * 1000)}, pf)
+                json.dump({
+                    "status": "running",
+                    "total_nodes": total_nodes,
+                    "tasks_done": tasks_done,
+                    "pid": pid,
+                    "elapsed_ms": int((time.monotonic() - t0) * 1000),
+                }, pf)
         except OSError:
             pass
-        raise
-    finally:
-        f.close()
 
-    # k-way 合并所有 per-move .bin → 最终 worker .bin
-    if move_bins:
-        iters = [_iter_records(p) for p in move_bins if os.path.exists(p)]
-        count = 0
-        with open(bin_path, "wb") as out:
-            _write_header(out, status=1, count=0)
-            for rec in heapq.merge(*iters):
-                out.write(rec)
-                count += 1
-            out.seek(0)
-            _write_header(out, status=1, count=count)
-        # 清理 per-move 临时文件
-        for p in move_bins:
-            for suffix in ("", ".results.json"):
-                try:
-                    os.remove(p + suffix)
-                except OSError:
-                    pass
-    else:
-        with open(bin_path, "wb") as out:
-            _write_header(out, status=1, count=0)
-
-    # 清理增量 tmp
-    try:
-        os.remove(tmp_path)
-    except OSError:
-        pass
-
-    # 写 child_results
-    results_path = bin_path + ".results.json"
-    try:
-        with open(results_path, "w") as rf:
-            json.dump(child_results, rf)
-    except OSError:
-        pass
-
+    # Worker 退出
     try:
         with open(progress_path, "w") as pf:
-            json.dump({"status": "done", "total_nodes": total_nodes,
-                       "tt_size": total_tt_count,
-                       "elapsed_ms": int((time.monotonic() - t0) * 1000)}, pf)
+            json.dump({
+                "status": "done",
+                "total_nodes": total_nodes,
+                "tasks_done": tasks_done,
+                "pid": pid,
+                "elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }, pf)
     except OSError:
         pass
 
@@ -188,17 +139,17 @@ def _worker_solve(board_grid: List[int], last_capture: int,
 # 进度汇总
 # ============================================================
 
-def _aggregate_progress(workers: List[dict], progress_path: str,
-                        start_time: float) -> None:
+def _aggregate_progress(worker_progress_paths: List[str], progress_path: str,
+                        start_time: float, done_count: int, total_count: int) -> None:
     total_nodes = 0
-    total_tt = 0
+    total_tasks = 0
     active = 0
-    for w in workers:
+    for wp_path in worker_progress_paths:
         try:
-            with open(w["progress"]) as f:
+            with open(wp_path) as f:
                 wp = json.load(f)
-            total_nodes += wp.get("total_nodes", wp.get("nodes", 0))
-            total_tt += wp.get("tt_size", wp.get("tt_flushed", 0))
+            total_nodes += wp.get("total_nodes", 0)
+            total_tasks += wp.get("tasks_done", 0)
             if wp.get("status") == "running":
                 active += 1
         except (FileNotFoundError, json.JSONDecodeError, OSError):
@@ -208,60 +159,80 @@ def _aggregate_progress(workers: List[dict], progress_path: str,
     try:
         with open(progress_path, "w") as f:
             json.dump({
-                "status": "running" if active > 0 else "merging",
+                "status": "running",
                 "total_nodes": total_nodes,
-                "total_tt": total_tt,
                 "elapsed_ms": elapsed_ms,
                 "nodes_per_sec": nps,
                 "workers_active": active,
-                "workers_total": len(workers),
+                "done_moves": done_count,
+                "total_moves": total_count,
             }, f)
     except OSError:
         pass
 
 
 # ============================================================
-# coordinator 辅助
+# 合并所有根着 .bin → 主 .bin
 # ============================================================
 
-def _write_pids(workers: List[dict], pids_path: str) -> None:
-    """写入所有 worker 的当前 pid。"""
-    try:
-        with open(pids_path, "w") as f:
-            json.dump([w["process"].pid for w in workers], f)
-    except OSError:
-        pass
+def _merge_all_bins(all_results: dict, cache_dir: str, job_id: str,
+                    main_bin_path: str, attacker_color: int, first_turn: int) -> None:
+    """k-way 归并所有根着的排序 .bin → 主 .bin。"""
+    # 计算根 pn/dn
+    is_or = (first_turn == attacker_color)
+    child_pns = []
+    child_dns = []
+    for move, (result, pn, dn, _nodes) in all_results.items():
+        child_pns.append(pn)
+        child_dns.append(dn)
 
+    if child_pns:
+        if is_or:
+            root_pn = min(child_pns)
+            root_dn = min(sum(child_dns), DFPN_INF)
+        else:
+            root_pn = min(sum(child_pns), DFPN_INF)
+            root_dn = min(child_dns)
+    else:
+        root_pn, root_dn = DFPN_INF, DFPN_INF
 
-def _restart_worker(w: dict, wi: int, board_grid, last_capture, region,
-                    kill_targets, defend_targets, attacker_color, first_turn,
-                    buckets, retry_count: List[int]) -> None:
-    """重启一个 crashed worker。清理残留文件，保留 checkpoint，启动新进程。"""
-    retry_count[wi] += 1
+    result_str = "ATTACKER_WINS" if root_pn == 0 else (
+        "DEFENDER_WINS" if root_dn == 0 else "UNPROVEN")
 
-    # 清理残留的 progress 和 tmp（per-move .bin checkpoint 保留）
-    for path in (w["progress"], w["bin"] + ".tmp"):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    # 收集所有根着的 .bin 文件
+    bin_paths = []
+    for move in all_results:
+        bp = os.path.join(cache_dir, f"{job_id}_{move[0]}_{move[1]}.bin")
+        if os.path.exists(bp) and os.path.getsize(bp) >= _HEADER_SIZE:
+            bin_paths.append(bp)
 
-    logging.warning("worker %d (pid=%d) 异常退出(exit=%d), 第 %d 次重启",
-                    wi, w["process"].pid, w["process"].exitcode,
-                    retry_count[wi])
+    # k-way 归并
+    os.makedirs(os.path.dirname(main_bin_path) or ".", exist_ok=True)
+    iters = [_iter_records(p) for p in bin_paths]
+    with open(main_bin_path, "wb") as f:
+        _write_header(f, status=1, result=_RESULT_MAP.get(result_str, 0),
+                      count=0, root_pn=min(root_pn, 0xFFFFFFFF),
+                      root_dn=min(root_dn, 0xFFFFFFFF))
+        count = 0
+        for rec in heapq.merge(*iters):
+            f.write(rec)
+            count += 1
+        f.seek(0)
+        _write_header(f, status=1, result=_RESULT_MAP.get(result_str, 0),
+                      count=count, root_pn=min(root_pn, 0xFFFFFFFF),
+                      root_dn=min(root_dn, 0xFFFFFFFF))
 
-    new_p = mp.Process(target=_worker_solve, args=(
-        board_grid, last_capture, region,
-        kill_targets, defend_targets, attacker_color, first_turn,
-        buckets[wi], w["bin"], w["progress"],
-    ))
-    new_p.start()
-    w["process"] = new_p
-    return True
+    # 清理根着 .bin 和临时文件
+    for bp in bin_paths:
+        for suffix in ("", ".tmp", ".flush0.tmp", ".flush1.tmp"):
+            try:
+                os.remove(bp + suffix)
+            except OSError:
+                pass
 
 
 # ============================================================
-# 多进程并行入口（coordinator）
+# Coordinator（主入口）
 # ============================================================
 
 def run_precompute_parallel(board_grid: List[int], last_capture: int,
@@ -271,15 +242,17 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
                             attacker_color: int, first_turn: int,
                             bin_path: str, progress_path: str,
                             num_workers: Optional[int] = None) -> None:
-    """coordinator：生成根候选 → 分配到 W 个 worker → 监控(自动重启) → 合并。"""
+    """Coordinator：生成根候选 → 任务队列 → 启动 worker → 事件循环 → 合并。"""
     if num_workers is None:
-        num_workers = max(1, mp.cpu_count() - 1)
+        num_workers = _calc_num_workers()
+    max_entries = _calc_max_tt_entries(num_workers)
 
     board = Board(BOARD_SIZE)
     board.grid = list(board_grid)
     board.last_capture = last_capture
     board.rebuild_zh()
 
+    # 生成根候选
     tmp_solver = DfpnSolver(
         board, region, attacker_color=attacker_color,
         kill_targets=[tuple(c) for c in kill_targets],
@@ -298,128 +271,147 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
             json.dump({"status": "done", "total_nodes": 0}, f)
         return
 
-    # LPT 调度
-    difficulty = []
-    for mx, my in root_moves:
-        u = board.play_undoable(mx, my, first_turn)
-        if u is None:
-            difficulty.append(0)
-            continue
-        probe = DfpnSolver(
-            board, region, attacker_color=attacker_color,
-            kill_targets=[tuple(c) for c in kill_targets],
-            defend_targets=[tuple(c) for c in defend_targets],
-            max_nodes=500, max_time_ms=200,
-        )
-        r = probe.solve(-first_turn)
-        difficulty.append(r["nodes"] if r["result"] == "UNPROVEN" else 0)
-        board.undo(u)
-
-    sorted_moves = sorted(zip(difficulty, root_moves), reverse=True)
-    buckets: List[List[Tuple[int, int]]] = [[] for _ in range(num_workers)]
-    for i, (_, move) in enumerate(sorted_moves):
-        buckets[i % num_workers].append(move)
-
     cache_dir = os.path.dirname(bin_path) or "."
     job_id = os.path.splitext(os.path.basename(bin_path))[0]
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # 初始化队列
+    task_queue = mp.Queue()
+    result_queue = mp.Queue()
+    heartbeat_queue = mp.Queue()
+
+    for move in root_moves:
+        move_bin = os.path.join(cache_dir, f"{job_id}_{move[0]}_{move[1]}.bin")
+        task_queue.put((move, move_bin))
+
+    # 启动 workers
     workers = []
-    start_time = time.monotonic()
+    worker_progress = []
     for wi in range(num_workers):
-        if not buckets[wi]:
-            continue
-        wbin = os.path.join(cache_dir, f"{job_id}_w{wi}.bin")
-        wprog = os.path.join(cache_dir, f"{job_id}_w{wi}_progress.json")
-        p = mp.Process(target=_worker_solve, args=(
+        wp = os.path.join(cache_dir, f"{job_id}_worker{wi}_progress.json")
+        worker_progress.append(wp)
+        p = mp.Process(target=_worker_loop, args=(
+            task_queue, result_queue, heartbeat_queue,
             board_grid, last_capture, region,
             kill_targets, defend_targets, attacker_color, first_turn,
-            buckets[wi], wbin, wprog,
+            max_entries, DEFAULT_BUDGET, wp,
         ))
         p.start()
-        workers.append({"process": p, "bin": wbin, "progress": wprog})
+        workers.append(p)
 
+    # 写 PID 文件
     pids_path = os.path.join(cache_dir, f"{job_id}_pids.json")
-    _write_pids(workers, pids_path)
+    try:
+        with open(pids_path, "w") as f:
+            json.dump([p.pid for p in workers], f)
+    except OSError:
+        pass
 
-    # 监控 worker 进程（含自动重启）
-    finished = set()           # 正常完成的 worker index
-    retry_count = [0] * len(workers)
+    # 事件循环
+    start_time = time.monotonic()
+    all_results: Dict[Tuple[int, int], Tuple[str, int, int, int]] = {}
+    in_flight: Dict[Tuple[int, int], int] = {}  # move → worker pid
 
-    while True:
-        alive = False
-        for i, w in enumerate(workers):
-            if i in finished:
-                continue
-            p = w["process"]
-            if p.is_alive():
-                alive = True
-                continue
-            # 进程已退出
-            if p.exitcode == 0:
-                finished.add(i)
-                continue
-            # 异常退出 → 重启
-            _restart_worker(w, i, board_grid, last_capture, region,
-                            kill_targets, defend_targets, attacker_color,
-                            first_turn, buckets, retry_count)
-            _write_pids(workers, pids_path)
-            alive = True
+    while len(all_results) < len(root_moves):
+        # 收集心跳
+        while not heartbeat_queue.empty():
+            try:
+                msg = heartbeat_queue.get_nowait()
+                action, move, pid = msg
+                if action == "start":
+                    in_flight[move] = pid
+                elif action in ("done", "requeue"):
+                    in_flight.pop(move, None)
+            except Exception:
+                break
 
-        _aggregate_progress(workers, progress_path, start_time)
-        if not alive:
-            break
+        # 收集结果
+        while not result_queue.empty():
+            try:
+                move, result, pn, dn, nodes = result_queue.get_nowait()
+                all_results[move] = (result, pn, dn, nodes)
+            except Exception:
+                break
+
+        # 检查 worker 存活，崩溃则补充
+        for i, p in enumerate(workers):
+            if p.is_alive() or p.exitcode == 0:
+                continue
+            if p.exitcode is not None and p.exitcode != 0:
+                # Worker 崩溃 → 回收 in_flight 的任务
+                dead_pid = p.pid
+                lost_moves = [m for m, pid in in_flight.items() if pid == dead_pid]
+                for m in lost_moves:
+                    if m not in all_results:
+                        move_bin = os.path.join(cache_dir, f"{job_id}_{m[0]}_{m[1]}.bin")
+                        task_queue.put((m, move_bin))
+                    in_flight.pop(m, None)
+                # 启动替补 worker
+                wp = worker_progress[i]
+                new_p = mp.Process(target=_worker_loop, args=(
+                    task_queue, result_queue, heartbeat_queue,
+                    board_grid, last_capture, region,
+                    kill_targets, defend_targets, attacker_color, first_turn,
+                    max_entries, DEFAULT_BUDGET, wp,
+                ))
+                new_p.start()
+                workers[i] = new_p
+
+        _aggregate_progress(worker_progress, progress_path, start_time,
+                            len(all_results), len(root_moves))
         time.sleep(2)
 
-    _aggregate_progress(workers, progress_path, start_time)
+    # 发送 poison pills
+    for _ in range(num_workers):
+        task_queue.put(None)
+    for p in workers:
+        if p.is_alive():
+            p.join(timeout=10)
 
-    # 收集每个 worker 的最终状态
-    worker_snapshots = []
-    for i, w in enumerate(workers):
-        snap = {
-            "worker": i,
-            "pid": w["process"].pid,
-            "exitcode": w["process"].exitcode,
-            "moves": buckets[i] if i < len(buckets) else [],
-            "retries": retry_count[i],
-        }
+    # 合并
+    _merge_all_bins(all_results, cache_dir, job_id, bin_path,
+                    attacker_color, first_turn)
+
+    # 清理临时文件
+    for wp in worker_progress:
         try:
-            with open(w["progress"]) as f:
-                wp = json.load(f)
-            snap["total_nodes"] = wp.get("total_nodes", wp.get("nodes", 0))
-            snap["tt_size"] = wp.get("tt_size", wp.get("tt_flushed", 0))
-            snap["elapsed_ms"] = wp.get("elapsed_ms", 0)
-            snap["status"] = wp.get("status", "unknown")
-            snap["current_move"] = wp.get("current_move")
-            if wp.get("error"):
-                snap["error"] = wp["error"]
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            snap["status"] = "unknown"
-            snap["total_nodes"] = 0
-            snap["tt_size"] = 0
-            snap["elapsed_ms"] = 0
-        if os.path.exists(w["bin"]):
-            whdr = _read_header(w["bin"])
-            if whdr:
-                snap["bin_count"] = whdr["count"]
-        worker_snapshots.append(snap)
-
-    # 所有 worker 都已正常完成（无限重启保证），合并
-    _merge_worker_bins(workers, bin_path, attacker_color, first_turn)
-
+            os.remove(wp)
+        except OSError:
+            pass
     try:
         os.remove(pids_path)
     except OSError:
         pass
 
+    # 最终进度
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
-    total_nodes = sum(s.get("total_nodes", 0) for s in worker_snapshots)
-    total_retries = sum(retry_count)
-    msg = "merged"
-    if total_retries > 0:
-        msg = f"merged (共重启 {total_retries} 次)"
+    total_nodes = sum(v[3] for v in all_results.values())
     with open(progress_path, "w") as f:
-        json.dump({"status": "done", "total_nodes": total_nodes,
-                   "elapsed_ms": elapsed_ms,
-                   "message": msg,
-                   "total_retries": total_retries,
-                   "total_workers": len(workers),
-                   "workers": worker_snapshots}, f)
+        json.dump({
+            "status": "done",
+            "total_nodes": total_nodes,
+            "elapsed_ms": elapsed_ms,
+            "message": "merged",
+            "done_moves": len(all_results),
+            "total_moves": len(root_moves),
+        }, f)
+
+
+# ============================================================
+# CLI 入口
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: pypy3 precompute.py <config.json>", file=sys.stderr)
+        sys.exit(1)
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    run_precompute_parallel(
+        cfg["board"], cfg["last_capture"], cfg["region"],
+        cfg["kill_targets"], cfg["defend_targets"],
+        cfg["attacker_color"], cfg["turn"],
+        cfg["db_path"], cfg["progress_path"],
+        cfg.get("num_workers"),
+    )

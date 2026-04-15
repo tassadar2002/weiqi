@@ -251,6 +251,148 @@ class BinCache:
 # 查表求解（预处理完成后）
 # ============================================================
 
+# ============================================================
+# DiskTT: 内存缓冲 + 磁盘存储（内存可控的 TT）
+# ============================================================
+
+def _calc_num_workers() -> int:
+    """Worker 数 = CPU 核数 × 70%，至少 1。"""
+    import multiprocessing
+    return max(1, int(multiprocessing.cpu_count() * 0.7))
+
+
+def _calc_max_tt_entries(num_workers: int) -> int:
+    """每个 worker 的 TT 内存缓冲上限。所有 worker 合计使用可用内存的 70%。"""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    avail_bytes = int(line.split()[1]) * 1024
+                    break
+            else:
+                avail_bytes = 4 * 1024**3
+    except OSError:
+        avail_bytes = 4 * 1024**3
+
+    import platform
+    per_entry = 112 if platform.python_implementation() == "PyPy" else 188
+
+    per_worker = int(avail_bytes * 0.7) // max(num_workers, 1)
+    return max(100_000, min(per_worker // per_entry, 50_000_000))
+
+
+def _merge_flush(out, disk_iter, sorted_mem) -> int:
+    """双路归并：disk records + 内存排序条目 → out。相同 key 以 mem 为准。"""
+    disk_rec = next(disk_iter, None)
+    mem_idx = 0
+    count = 0
+
+    while disk_rec is not None or mem_idx < len(sorted_mem):
+        dk = disk_rec[:10] if disk_rec else None
+        mk = _pack_key(sorted_mem[mem_idx][0]) if mem_idx < len(sorted_mem) else None
+
+        if dk is not None and (mk is None or dk < mk):
+            out.write(disk_rec)
+            count += 1
+            disk_rec = next(disk_iter, None)
+        elif mk is not None and (dk is None or mk < dk):
+            key, (pn, dn) = sorted_mem[mem_idx]
+            out.write(_pack_record(key, pn, dn))
+            count += 1
+            mem_idx += 1
+        else:
+            # 相同 key → mem 覆盖 disk
+            key, (pn, dn) = sorted_mem[mem_idx]
+            out.write(_pack_record(key, pn, dn))
+            count += 1
+            mem_idx += 1
+            disk_rec = next(disk_iter, None)
+
+    return count
+
+
+class DiskTT:
+    """内存缓冲 + 磁盘存储的 TT。内存可控，数据不丢失。
+
+    - get(key): 先查内存 O(1)，miss → 查磁盘 O(log N)
+    - set(key, pn, dn): 写内存，满 → flush 归并到磁盘
+    - close(): 最后一次 flush + 关闭 mmap
+    """
+
+    def __init__(self, bin_path: str, max_entries: int):
+        self.bin_path = bin_path
+        self.max_entries = max_entries
+        self.mem: Dict[tuple, Tuple[int, int]] = {}
+        self.disk: Optional[BinCache] = None
+        self._flush_count = 0
+        # .bin 已存在（之前的段的 checkpoint）→ 打开磁盘层
+        if os.path.exists(bin_path) and os.path.getsize(bin_path) >= _HEADER_SIZE:
+            self.disk = BinCache(bin_path)
+
+    def get(self, key: tuple) -> Tuple[int, int]:
+        r = self.mem.get(key)
+        if r is not None:
+            return r
+        if self.disk:
+            r = self.disk.lookup(key)
+            if r is not None:
+                return r
+        return (1, 1)
+
+    def set(self, key: tuple, pn: int, dn: int) -> None:
+        self.mem[key] = (pn, dn)
+        if len(self.mem) >= self.max_entries:
+            self.flush()
+
+    def flush(self) -> None:
+        """内存排序 + 与磁盘双路归并 → 新 .bin。"""
+        if not self.mem:
+            return
+        sorted_mem = sorted(self.mem.items())
+        tmp_path = self.bin_path + f".flush{self._flush_count}.tmp"
+        os.makedirs(os.path.dirname(self.bin_path) or ".", exist_ok=True)
+
+        with open(tmp_path, "wb") as out:
+            _write_header(out, status=0, count=0)
+            if self.disk:
+                count = _merge_flush(out, _iter_records(self.disk.path), sorted_mem)
+            else:
+                count = 0
+                for key, (pn, dn) in sorted_mem:
+                    out.write(_pack_record(key, pn, dn))
+                    count += 1
+            out.seek(0)
+            _write_header(out, status=0, count=count)
+
+        if self.disk:
+            self.disk.close()
+        os.replace(tmp_path, self.bin_path)
+        self.disk = BinCache(self.bin_path)
+        self.mem.clear()
+        self._flush_count += 1
+
+    def tt_size(self) -> int:
+        """总条目数（内存 + 磁盘）。"""
+        disk_count = self.disk.count if self.disk else 0
+        return len(self.mem) + disk_count
+
+    def close(self) -> None:
+        self.flush()
+        if self.disk:
+            self.disk.close()
+            self.disk = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+# ============================================================
+# 查表求解（预处理完成后）
+# ============================================================
+
 def solve_from_cache(cache: BinCache,
                      board: Board, turn: int, region_mask: List[int],
                      attacker_color: int) -> dict:
