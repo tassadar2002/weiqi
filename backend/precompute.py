@@ -232,6 +232,134 @@ def _merge_all_bins(all_results: dict, cache_dir: str, job_id: str,
 
 
 # ============================================================
+# Coordinator 辅助
+# ============================================================
+
+def _gen_root_moves(board_grid: List[int], last_capture: int, region: List[int],
+                    kill_targets: List[List[int]], defend_targets: List[List[int]],
+                    attacker_color: int, first_turn: int) -> List[Tuple[int, int]]:
+    """生成所有合法的根着法。"""
+    board = Board(BOARD_SIZE)
+    board.grid = list(board_grid)
+    board.last_capture = last_capture
+    board.rebuild_zh()
+    tmp = DfpnSolver(
+        board, region, attacker_color=attacker_color,
+        kill_targets=[tuple(c) for c in kill_targets],
+        defend_targets=[tuple(c) for c in defend_targets],
+        max_nodes=1, max_time_ms=1,
+    )
+    kids = tmp._gen_children(first_turn, allow_pass=(first_turn != attacker_color))
+    return [m for m, _ in kids if m is not None]
+
+
+def _start_workers(num_workers: int, task_queue, result_queue, heartbeat_queue,
+                   board_grid, last_capture, region, kill_targets, defend_targets,
+                   attacker_color, first_turn, max_entries, cache_dir, job_id):
+    """启动 worker 进程，返回 (workers, worker_progress_paths)。"""
+    workers = []
+    progress_paths = []
+    for wi in range(num_workers):
+        wp = os.path.join(cache_dir, f"{job_id}_worker{wi}_progress.json")
+        progress_paths.append(wp)
+        p = mp.Process(target=_worker_loop, args=(
+            task_queue, result_queue, heartbeat_queue,
+            board_grid, last_capture, region,
+            kill_targets, defend_targets, attacker_color, first_turn,
+            max_entries, DEFAULT_BUDGET, wp,
+        ))
+        p.start()
+        workers.append(p)
+    return workers, progress_paths
+
+
+def _drain_queues(heartbeat_queue, result_queue, in_flight, all_results):
+    """非阻塞收集心跳和结果。"""
+    while not heartbeat_queue.empty():
+        try:
+            action, move, pid = heartbeat_queue.get_nowait()
+            if action == "start":
+                in_flight[move] = pid
+            elif action in ("done", "requeue"):
+                in_flight.pop(move, None)
+        except Exception:
+            break
+    while not result_queue.empty():
+        try:
+            move, result, pn, dn, nodes = result_queue.get_nowait()
+            all_results[move] = (result, pn, dn, nodes)
+        except Exception:
+            break
+
+
+def _recover_crashed_workers(workers, worker_progress, in_flight, all_results,
+                             task_queue, result_queue, heartbeat_queue,
+                             board_grid, last_capture, region,
+                             kill_targets, defend_targets, attacker_color,
+                             first_turn, max_entries, cache_dir, job_id):
+    """检测崩溃的 worker，回收任务，启动替补。"""
+    for i, p in enumerate(workers):
+        if p.is_alive() or p.exitcode == 0:
+            continue
+        if p.exitcode is None:
+            continue
+        # 崩溃 → 回收 in_flight 任务
+        dead_pid = p.pid
+        for m in [m for m, pid in in_flight.items() if pid == dead_pid]:
+            if m not in all_results:
+                move_bin = os.path.join(cache_dir, f"{job_id}_{m[0]}_{m[1]}.bin")
+                task_queue.put((m, move_bin))
+            in_flight.pop(m, None)
+        # 启动替补
+        wp = worker_progress[i]
+        new_p = mp.Process(target=_worker_loop, args=(
+            task_queue, result_queue, heartbeat_queue,
+            board_grid, last_capture, region,
+            kill_targets, defend_targets, attacker_color, first_turn,
+            max_entries, DEFAULT_BUDGET, wp,
+        ))
+        new_p.start()
+        workers[i] = new_p
+
+
+def _shutdown_workers(workers, task_queue, num_workers):
+    """发送 poison pills 并等待所有 worker 退出。"""
+    for _ in range(num_workers):
+        task_queue.put(None)
+    for p in workers:
+        if p.is_alive():
+            p.join(timeout=10)
+
+
+def _cleanup(worker_progress, pids_path):
+    """清理临时文件。"""
+    for wp in worker_progress:
+        try:
+            os.remove(wp)
+        except OSError:
+            pass
+    try:
+        os.remove(pids_path)
+    except OSError:
+        pass
+
+
+def _write_final_progress(progress_path, all_results, root_moves, start_time):
+    """写入最终进度文件。"""
+    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+    total_nodes = sum(v[3] for v in all_results.values())
+    with open(progress_path, "w") as f:
+        json.dump({
+            "status": "done",
+            "total_nodes": total_nodes,
+            "elapsed_ms": elapsed_ms,
+            "message": "merged",
+            "done_moves": len(all_results),
+            "total_moves": len(root_moves),
+        }, f)
+
+
+# ============================================================
 # Coordinator（主入口）
 # ============================================================
 
@@ -247,23 +375,15 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
         num_workers = _calc_num_workers()
     max_entries = _calc_max_tt_entries(num_workers)
 
-    board = Board(BOARD_SIZE)
-    board.grid = list(board_grid)
-    board.last_capture = last_capture
-    board.rebuild_zh()
+    cache_dir = os.path.dirname(bin_path) or "."
+    job_id = os.path.splitext(os.path.basename(bin_path))[0]
+    os.makedirs(cache_dir, exist_ok=True)
 
-    # 生成根候选
-    tmp_solver = DfpnSolver(
-        board, region, attacker_color=attacker_color,
-        kill_targets=[tuple(c) for c in kill_targets],
-        defend_targets=[tuple(c) for c in defend_targets],
-        max_nodes=1, max_time_ms=1,
-    )
-    root_kids = tmp_solver._gen_children(first_turn, allow_pass=(first_turn != attacker_color))
-    root_moves = [m for m, _ in root_kids if m is not None]
-
+    # ── 1. 生成根候选 ──
+    root_moves = _gen_root_moves(board_grid, last_capture, region,
+                                 kill_targets, defend_targets,
+                                 attacker_color, first_turn)
     if not root_moves:
-        os.makedirs(os.path.dirname(bin_path) or ".", exist_ok=True)
         with open(bin_path, "wb") as f:
             _write_header(f, status=1, result=_RESULT_MAP["DEFENDER_WINS"],
                           count=0, root_pn=0xFFFFFFFF, root_dn=0)
@@ -271,35 +391,20 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
             json.dump({"status": "done", "total_nodes": 0}, f)
         return
 
-    cache_dir = os.path.dirname(bin_path) or "."
-    job_id = os.path.splitext(os.path.basename(bin_path))[0]
-    os.makedirs(cache_dir, exist_ok=True)
-
-    # 初始化队列
+    # ── 2. 初始化队列 + 放入任务 ──
     task_queue = mp.Queue()
     result_queue = mp.Queue()
     heartbeat_queue = mp.Queue()
-
     for move in root_moves:
         move_bin = os.path.join(cache_dir, f"{job_id}_{move[0]}_{move[1]}.bin")
         task_queue.put((move, move_bin))
 
-    # 启动 workers
-    workers = []
-    worker_progress = []
-    for wi in range(num_workers):
-        wp = os.path.join(cache_dir, f"{job_id}_worker{wi}_progress.json")
-        worker_progress.append(wp)
-        p = mp.Process(target=_worker_loop, args=(
-            task_queue, result_queue, heartbeat_queue,
-            board_grid, last_capture, region,
-            kill_targets, defend_targets, attacker_color, first_turn,
-            max_entries, DEFAULT_BUDGET, wp,
-        ))
-        p.start()
-        workers.append(p)
+    # ── 3. 启动 workers ──
+    workers, worker_progress = _start_workers(
+        num_workers, task_queue, result_queue, heartbeat_queue,
+        board_grid, last_capture, region, kill_targets, defend_targets,
+        attacker_color, first_turn, max_entries, cache_dir, job_id)
 
-    # 写 PID 文件
     pids_path = os.path.join(cache_dir, f"{job_id}_pids.json")
     try:
         with open(pids_path, "w") as f:
@@ -307,94 +412,31 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     except OSError:
         pass
 
-    # 事件循环
+    # ── 4. 事件循环 ──
     start_time = time.monotonic()
     all_results: Dict[Tuple[int, int], Tuple[str, int, int, int]] = {}
-    in_flight: Dict[Tuple[int, int], int] = {}  # move → worker pid
+    in_flight: Dict[Tuple[int, int], int] = {}
 
     while len(all_results) < len(root_moves):
-        # 收集心跳
-        while not heartbeat_queue.empty():
-            try:
-                msg = heartbeat_queue.get_nowait()
-                action, move, pid = msg
-                if action == "start":
-                    in_flight[move] = pid
-                elif action in ("done", "requeue"):
-                    in_flight.pop(move, None)
-            except Exception:
-                break
-
-        # 收集结果
-        while not result_queue.empty():
-            try:
-                move, result, pn, dn, nodes = result_queue.get_nowait()
-                all_results[move] = (result, pn, dn, nodes)
-            except Exception:
-                break
-
-        # 检查 worker 存活，崩溃则补充
-        for i, p in enumerate(workers):
-            if p.is_alive() or p.exitcode == 0:
-                continue
-            if p.exitcode is not None and p.exitcode != 0:
-                # Worker 崩溃 → 回收 in_flight 的任务
-                dead_pid = p.pid
-                lost_moves = [m for m, pid in in_flight.items() if pid == dead_pid]
-                for m in lost_moves:
-                    if m not in all_results:
-                        move_bin = os.path.join(cache_dir, f"{job_id}_{m[0]}_{m[1]}.bin")
-                        task_queue.put((m, move_bin))
-                    in_flight.pop(m, None)
-                # 启动替补 worker
-                wp = worker_progress[i]
-                new_p = mp.Process(target=_worker_loop, args=(
-                    task_queue, result_queue, heartbeat_queue,
-                    board_grid, last_capture, region,
-                    kill_targets, defend_targets, attacker_color, first_turn,
-                    max_entries, DEFAULT_BUDGET, wp,
-                ))
-                new_p.start()
-                workers[i] = new_p
-
+        _drain_queues(heartbeat_queue, result_queue, in_flight, all_results)
+        _recover_crashed_workers(
+            workers, worker_progress, in_flight, all_results,
+            task_queue, result_queue, heartbeat_queue,
+            board_grid, last_capture, region,
+            kill_targets, defend_targets, attacker_color,
+            first_turn, max_entries, cache_dir, job_id)
         _aggregate_progress(worker_progress, progress_path, start_time,
                             len(all_results), len(root_moves))
         time.sleep(2)
 
-    # 发送 poison pills
-    for _ in range(num_workers):
-        task_queue.put(None)
-    for p in workers:
-        if p.is_alive():
-            p.join(timeout=10)
+    # ── 5. 关闭 workers ──
+    _shutdown_workers(workers, task_queue, num_workers)
 
-    # 合并
+    # ── 6. 合并 + 清理 ──
     _merge_all_bins(all_results, cache_dir, job_id, bin_path,
                     attacker_color, first_turn)
-
-    # 清理临时文件
-    for wp in worker_progress:
-        try:
-            os.remove(wp)
-        except OSError:
-            pass
-    try:
-        os.remove(pids_path)
-    except OSError:
-        pass
-
-    # 最终进度
-    elapsed_ms = int((time.monotonic() - start_time) * 1000)
-    total_nodes = sum(v[3] for v in all_results.values())
-    with open(progress_path, "w") as f:
-        json.dump({
-            "status": "done",
-            "total_nodes": total_nodes,
-            "elapsed_ms": elapsed_ms,
-            "message": "merged",
-            "done_moves": len(all_results),
-            "total_moves": len(root_moves),
-        }, f)
+    _cleanup(worker_progress, pids_path)
+    _write_final_progress(progress_path, all_results, root_moves, start_time)
 
 
 # ============================================================
