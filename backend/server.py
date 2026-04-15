@@ -11,7 +11,7 @@ import os
 import re
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -210,7 +210,7 @@ class Handler(BaseHTTPRequestHandler):
         moves = board.legal_moves_in_region(int(data["color"]), data["region"])
         self._json(200, {"moves": [list(m) for m in moves]})
 
-    # ---- Solve (查表) ----
+    # ---- Solve (查表，需预处理完成) ----
 
     def _h_solve(self, data):
         board = _board_from(data)
@@ -221,62 +221,18 @@ class Handler(BaseHTTPRequestHandler):
         defend_coords = [tuple(c) for c in target.get("defend_targets_coords", [])]
         region = data["region"]
 
-        # 检查预处理缓存
         cache_id = data.get("precompute_cache_id")
-        if cache_id:
-            bin_path = os.path.join(CACHE_DIR, f"{cache_id}.bin")
-            if os.path.exists(bin_path):
-                with BinCache(bin_path) as cache:
-                    result = solve_from_cache(cache, board, turn, region, attacker)
-                result["cached"] = True
-                result["multi_status"] = _multi_status(
-                    board, [list(c) for c in kill_coords], [list(c) for c in defend_coords])
-                self._json(200, result)
-                return
-
-        # 无缓存：在线 df-pn（有时间限制）
-        from solver import DfpnSolver
-        max_time = int(data.get("max_time_ms", 60_000))
-        max_nodes = int(data.get("max_nodes", 5_000_000))
-        solver = DfpnSolver(
-            board, region, attacker_color=attacker,
-            kill_targets=list(kill_coords), defend_targets=list(defend_coords),
-            max_nodes=max_nodes, max_time_ms=max_time,
-        )
-        r = solver.solve(turn)
-        # 从 TT 提取最优着
-        r["move"] = self._extract_move(solver, board, turn, region, attacker)
-        r["cached"] = False
-        r["multi_status"] = _multi_status(
+        if not cache_id:
+            self._json(400, {"error": "需要预处理缓存"}); return
+        bin_path = os.path.join(CACHE_DIR, f"{cache_id}.bin")
+        if not os.path.exists(bin_path):
+            self._json(400, {"error": "预处理缓存不存在"}); return
+        with BinCache(bin_path) as cache:
+            result = solve_from_cache(cache, board, turn, region, attacker)
+        result["cached"] = True
+        result["multi_status"] = _multi_status(
             board, [list(c) for c in kill_coords], [list(c) for c in defend_coords])
-        self._json(200, r)
-
-    def _extract_move(self, solver, board, turn, region, attacker):
-        """从 solver 的 TT 中提取最优着（含顽抗着逻辑）。"""
-        is_or = (turn == attacker)
-        winning = None
-        resist_move = None
-        resist_score = -1
-        any_move = None
-        for x, y in board.legal_moves_in_region(turn, region):
-            if any_move is None: any_move = (x, y)
-            u = board.play_undoable(x, y, turn)
-            if u is None: continue
-            cpn, cdn = solver._tt_get(-turn)
-            board.undo(u)
-            if is_or and cpn == 0:
-                return {"x": x, "y": y, "certain": True}
-            elif not is_or and cdn == 0:
-                return {"x": x, "y": y, "certain": True}
-            score = cpn if is_or else cdn
-            if score > resist_score:
-                resist_score = score
-                resist_move = (x, y)
-        if resist_move:
-            return {"x": resist_move[0], "y": resist_move[1], "certain": False}
-        if any_move:
-            return {"x": any_move[0], "y": any_move[1], "certain": False}
-        return None
+        self._json(200, result)
 
     def do_OPTIONS(self):
         self.send_response(200)
