@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from precompute import load_tt_from_sqlite, solve_from_cache
+from precompute import load_tt_from_bin, solve_from_cache, _read_header
 from problems import (create_problem, delete_problem, get_problem, init_db,
                        list_problems, update_problem)
 from target import validate_target_stone
@@ -243,8 +243,8 @@ class Handler(BaseHTTPRequestHandler):
         cache_id = data.get("precompute_cache_id")
         if cache_id:
             job = _JOBS.get(cache_id)
-            if job and os.path.exists(job["db_path"]):
-                tt = load_tt_from_sqlite(job["db_path"])
+            if job and os.path.exists(job["bin_path"]):
+                tt = load_tt_from_bin(job["bin_path"])
                 result = solve_from_cache(tt, board, turn, region, attacker)
                 result["cached"] = True
                 result["multi_status"] = _multi_status(
@@ -300,9 +300,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _h_precompute_start(self, data):
         job_id = uuid.uuid4().hex[:12]
-        db_path = os.path.join(CACHE_DIR, f"{job_id}.db")
+        bin_path = os.path.join(CACHE_DIR, f"{job_id}.bin")
         progress_path = os.path.join(CACHE_DIR, f"{job_id}_progress.json")
-        # 写配置文件，用 subprocess 启动 pypy3
         config_path = os.path.join(CACHE_DIR, f"{job_id}_config.json")
         with open(config_path, "w") as f:
             json.dump({
@@ -313,7 +312,7 @@ class Handler(BaseHTTPRequestHandler):
                 "defend_targets": data["defend_targets"],
                 "attacker_color": int(data["attacker_color"]),
                 "turn": int(data.get("turn", 1)),
-                "db_path": db_path,
+                "db_path": bin_path,
                 "progress_path": progress_path,
                 "num_workers": None,
             }, f)
@@ -322,7 +321,7 @@ class Handler(BaseHTTPRequestHandler):
             [interpreter, _PRECOMPUTE_SCRIPT, config_path],
             cwd=os.path.dirname(_PRECOMPUTE_SCRIPT),
         )
-        _JOBS[job_id] = {"process": p, "db_path": db_path,
+        _JOBS[job_id] = {"process": p, "bin_path": bin_path,
                          "progress_path": progress_path, "config_path": config_path}
         # 关联到习题
         if "problem_id" in data:
@@ -341,23 +340,16 @@ class Handler(BaseHTTPRequestHandler):
         except (FileNotFoundError, json.JSONDecodeError):
             progress = {"status": "starting", "total_nodes": 0}
         proc = job["process"]
-        is_alive = proc.poll() is None  # subprocess.Popen: poll() returns None if running
+        is_alive = proc.poll() is None
         if not is_alive and progress.get("status") not in ("done", "merging"):
-            progress["status"] = "done" if os.path.exists(job["db_path"]) else "crashed"
-        # 检查 DB 是否已合并完成
-        if progress.get("status") in ("done", "merging") and os.path.exists(job["db_path"]):
-            try:
-                import sqlite3
-                db = sqlite3.connect(job["db_path"])
-                result = db.execute("SELECT value FROM metadata WHERE key='result'").fetchone()
-                tt_size = db.execute("SELECT value FROM metadata WHERE key='tt_size'").fetchone()
-                db.close()
-                if result:
-                    progress["status"] = "done"
-                    progress["result"] = result[0]
-                    progress["tt_size"] = int(tt_size[0]) if tt_size else 0
-            except Exception:
-                pass
+            progress["status"] = "done" if os.path.exists(job["bin_path"]) else "crashed"
+        # 检查 .bin header 是否已合并完成
+        if progress.get("status") in ("done", "merging") and os.path.exists(job["bin_path"]):
+            hdr = _read_header(job["bin_path"])
+            if hdr and hdr["status"] == 1:  # 1=done
+                progress["status"] = "done"
+                progress["result"] = hdr["result"]
+                progress["tt_size"] = hdr["count"]
         self._json(200, progress)
 
     def _h_precompute_stop(self, data):

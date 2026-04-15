@@ -3,13 +3,19 @@
 
 - run_precompute_parallel: 多进程并行穷举 df-pn
 - solve_from_cache: 预处理完成后的查表求解
-- load_tt_from_sqlite: 从 SQLite 加载 TT 到内存
+- load_tt_from_bin: 从二进制文件加载 TT 到内存
+
+二进制缓存格式 (.bin):
+  Header (20B): magic "WQ3C" + version u8 + status u8 + result u8 + pad u8
+                + count u32 + root_pn u32 + root_dn u32
+  Records (12B each): key 10B (zh u64 + turn i8 + lc u8) + pn u8 + dn u8
+  pn/dn 编码: 0~254 原值, 255 = DFPN_INF (10^9)
+  增量写入时允许重复 key，合并阶段去重（后覆盖前）。
 """
 
 import json
 import multiprocessing as mp
 import os
-import sqlite3
 import struct
 import time
 from typing import Dict, List, Optional, Tuple
@@ -17,89 +23,110 @@ from typing import Dict, List, Optional, Tuple
 from board import Board, BLACK, WHITE, EMPTY, BOARD_SIZE
 from solver import DfpnSolver
 
+DFPN_INF = 10**9
+_MAGIC = b"WQ3C"
+_HEADER_FMT = ">4sBBBxIII"  # 20 bytes
+_HEADER_SIZE = struct.calcsize(_HEADER_FMT)  # 20
+_RECORD_FMT = ">QbBBB"  # 12 bytes: zh(8) + turn(1) + lc(1) + pn(1) + dn(1)
+_RECORD_SIZE = struct.calcsize(_RECORD_FMT)  # 12
+
+# status: 0=running 1=done 2=stopped
+# result: 0=UNPROVEN 1=ATTACKER_WINS 2=DEFENDER_WINS
+_RESULT_MAP = {"UNPROVEN": 0, "ATTACKER_WINS": 1, "DEFENDER_WINS": 2}
+_RESULT_RMAP = {0: "UNPROVEN", 1: "ATTACKER_WINS", 2: "DEFENDER_WINS"}
+
 
 # ============================================================
-# SQLite 工具
+# 二进制读写
 # ============================================================
 
-def _init_db(db_path: str) -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
-    db = sqlite3.connect(db_path)
-    _exec(db, "PRAGMA journal_mode=WAL")
-    _exec(db, "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
-    _exec(db, "CREATE TABLE IF NOT EXISTS tt (key BLOB PRIMARY KEY, pn INTEGER, dn INTEGER)")
-    db.commit()
-    return db
+def _encode_pn(v: int) -> int:
+    return 255 if v >= 255 else v
 
-
-def _exec(db: sqlite3.Connection, sql: str, params=None) -> None:
-    """执行 SQL 并立即关闭 cursor（兼容 PyPy sqlite3）。"""
-    cur = db.cursor()
-    if params:
-        cur.execute(sql, params)
-    else:
-        cur.execute(sql)
-    cur.close()
-
-
-def _set_meta(db: sqlite3.Connection, key: str, value: str) -> None:
-    _exec(db, "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, value))
-
-
-def _get_meta(db: sqlite3.Connection, key: str) -> Optional[str]:
-    row = db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
-    return row[0] if row else None
-
+def _decode_pn(v: int) -> int:
+    return DFPN_INF if v == 255 else v
 
 def _pack_key(key: tuple) -> bytes:
-    """TT key (zh, turn, lc) → 10 字节 BLOB。
-    zh: uint64 (8B), turn: int8 (1B), lc: int16 用 uint8 编码 (1B, -1→255)。"""
+    """TT key (zh, turn, lc) → 10 字节。"""
     zh, turn, lc = key
     return struct.pack(">QbB", zh, turn, lc if lc >= 0 else 255)
 
-
 def _unpack_key(blob: bytes) -> tuple:
-    """10 字节 BLOB → (zh, turn, lc) tuple。"""
+    """10 字节 → (zh, turn, lc)。"""
     zh, turn, lc_u8 = struct.unpack(">QbB", blob)
     return (zh, turn, -1 if lc_u8 == 255 else lc_u8)
 
+def _write_header(f, status=0, result=0, count=0, root_pn=0, root_dn=0):
+    f.seek(0)
+    f.write(struct.pack(_HEADER_FMT, _MAGIC, 1, status, result, count, root_pn, root_dn))
 
-def _flush_tt_from_log(db: sqlite3.Connection, solver, already_flushed: int) -> None:
-    """增量写入：只写 tt_log 中 index >= already_flushed 的新条目。O(新增量)。"""
+def _read_header(path: str) -> Optional[dict]:
+    try:
+        with open(path, "rb") as f:
+            data = f.read(_HEADER_SIZE)
+        if len(data) < _HEADER_SIZE:
+            return None
+        magic, ver, status, result, count, root_pn, root_dn = struct.unpack(_HEADER_FMT, data)
+        if magic != _MAGIC:
+            return None
+        return {
+            "status": status, "result": _RESULT_RMAP.get(result, "UNPROVEN"),
+            "count": count, "root_pn": root_pn, "root_dn": root_dn,
+        }
+    except (OSError, struct.error):
+        return None
+
+def _flush_records(f, solver, already_flushed: int) -> int:
+    """增量追加新 TT 记录到文件。返回新的 flushed 计数。"""
     new_keys = solver.tt_log[already_flushed:]
-    if new_keys:
-        tt = solver.tt
-        cur = db.cursor()
-        cur.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)",
-                        [(_pack_key(k), tt[k][0], tt[k][1]) for k in new_keys])
-        cur.close()
+    if not new_keys:
+        return already_flushed
+    tt = solver.tt
+    buf = bytearray(len(new_keys) * _RECORD_SIZE)
+    offset = 0
+    for k in new_keys:
+        pn, dn = tt[k]
+        zh, turn, lc = k
+        struct.pack_into(_RECORD_FMT, buf, offset,
+                         zh, turn, lc if lc >= 0 else 255,
+                         _encode_pn(pn), _encode_pn(dn))
+        offset += _RECORD_SIZE
+    f.write(buf)
+    f.flush()
+    return already_flushed + len(new_keys)
 
-
-def load_tt_from_sqlite(db_path: str) -> Dict:
-    """从 SQLite 加载全部 TT 到内存 dict。"""
-    db = sqlite3.connect(db_path)
-    cur = db.cursor()
-    rows = cur.execute("SELECT key, pn, dn FROM tt").fetchall()
-    cur.close()
-    db.close()
+def _read_records(path: str) -> Dict[tuple, Tuple[int, int]]:
+    """读取 .bin 文件所有记录，后出现的 key 覆盖前面的（去重）。"""
     tt = {}
-    for key_blob, pn, dn in rows:
-        tt[_unpack_key(key_blob)] = (pn, dn)
+    try:
+        with open(path, "rb") as f:
+            header = f.read(_HEADER_SIZE)
+            if len(header) < _HEADER_SIZE:
+                return tt
+            while True:
+                rec = f.read(_RECORD_SIZE)
+                if len(rec) < _RECORD_SIZE:
+                    break
+                zh, turn, lc_u8, pn_u8, dn_u8 = struct.unpack(_RECORD_FMT, rec)
+                key = (zh, turn, -1 if lc_u8 == 255 else lc_u8)
+                tt[key] = (_decode_pn(pn_u8), _decode_pn(dn_u8))
+    except OSError:
+        pass
     return tt
+
+def load_tt_from_bin(path: str) -> Dict[tuple, Tuple[int, int]]:
+    """从 .bin 文件加载 TT 到内存 dict。"""
+    return _read_records(path)
 
 
 # ============================================================
 # 查表求解（预处理完成后）
 # ============================================================
 
-def solve_from_cache(tt: Dict[str, Tuple[int, int]],
+def solve_from_cache(tt: Dict[tuple, Tuple[int, int]],
                      board: Board, turn: int, region_mask: List[int],
                      attacker_color: int) -> dict:
-    """
-    纯查表，不跑 df-pn。毫秒级。
-    顽抗着：选对手最难推进的着法（最有可能让对手犯错）。
-    """
-    size = board.size
+    """纯查表，不跑 df-pn。毫秒级。"""
 
     def tt_key(t: int) -> tuple:
         return (board.zh, t, board.last_capture)
@@ -127,7 +154,6 @@ def solve_from_cache(tt: Dict[str, Tuple[int, int]],
         child_pn, child_dn = tt.get(tt_key(-turn), (1, 1))
         board.undo(u)
 
-        # 胜着
         if is_or and child_pn == 0:
             winning_move = (x, y)
             break
@@ -135,7 +161,6 @@ def solve_from_cache(tt: Dict[str, Tuple[int, int]],
             winning_move = (x, y)
             break
 
-        # 顽抗着：对手证胜代价最大 = 对手最容易犯错
         score = child_pn if is_or else child_dn
         if score > resist_score:
             resist_score = score
@@ -162,21 +187,21 @@ def _worker_solve(board_grid: List[int], last_capture: int,
                   kill_targets: List[List[int]], defend_targets: List[List[int]],
                   attacker_color: int, first_turn: int,
                   my_moves: List[Tuple[int, int]],
-                  db_path: str, progress_path: str) -> None:
-    """单个 worker：对分到的每个根候选着法跑 df-pn，增量写入 SQLite。"""
+                  bin_path: str, progress_path: str) -> None:
+    """单个 worker：对分到的每个根候选着法跑 df-pn，增量写入 .bin。"""
     board = Board(BOARD_SIZE)
     board.grid = list(board_grid)
     board.last_capture = last_capture
     board.rebuild_zh()
 
-    db = _init_db(db_path)
-    _exec(db, "CREATE TABLE IF NOT EXISTS results "
-          "(move TEXT PRIMARY KEY, pn INTEGER, dn INTEGER, nodes INTEGER)")
-    db.commit()
+    os.makedirs(os.path.dirname(bin_path) or ".", exist_ok=True)
+    f = open(bin_path, "wb")
+    _write_header(f, status=0)  # running
 
     total_nodes = 0
     t0 = time.monotonic()
     BATCH = 10_000
+    child_results = []  # [(move_str, pn, dn, nodes)]
 
     for mx, my in my_moves:
         u = board.play_undoable(mx, my, first_turn)
@@ -189,17 +214,15 @@ def _worker_solve(board_grid: List[int], last_capture: int,
             nonlocal last_flush
             new_count = len(solver.tt_log)
             if new_count - last_flush >= BATCH:
-                _flush_tt_from_log(db, solver, last_flush)
-                last_flush = new_count
-                db.commit()
+                last_flush = _flush_records(f, solver, last_flush)
             info["status"] = "running"
             info["total_nodes"] = total_nodes + info["nodes"]
             info["current_move"] = [mx, my]
             info["tt_flushed"] = last_flush
             info["tt_size"] = len(solver.tt)
             try:
-                with open(progress_path, "w") as f:
-                    json.dump(info, f)
+                with open(progress_path, "w") as pf:
+                    json.dump(info, pf)
             except OSError:
                 pass
 
@@ -214,17 +237,24 @@ def _worker_solve(board_grid: List[int], last_capture: int,
         total_nodes += r["nodes"]
 
         # flush 剩余
-        _flush_tt_from_log(db, solver, last_flush)
-        _exec(db, "INSERT OR REPLACE INTO results (move, pn, dn, nodes) VALUES (?, ?, ?, ?)",
-              (f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
-        db.commit()
+        _flush_records(f, solver, last_flush)
+        child_results.append((f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
         board.undo(u)
 
-    db.close()
+    f.close()
+
+    # 写 child_results 到 JSON（供 coordinator 合并时计算根 pn/dn）
+    results_path = bin_path + ".results.json"
     try:
-        with open(progress_path, "w") as f:
+        with open(results_path, "w") as rf:
+            json.dump(child_results, rf)
+    except OSError:
+        pass
+
+    try:
+        with open(progress_path, "w") as pf:
             json.dump({"status": "done", "total_nodes": total_nodes,
-                       "elapsed_ms": int((time.monotonic() - t0) * 1000)}, f)
+                       "elapsed_ms": int((time.monotonic() - t0) * 1000)}, pf)
     except OSError:
         pass
 
@@ -266,56 +296,62 @@ def _aggregate_progress(workers: List[dict], progress_path: str,
 
 
 # ============================================================
-# 合并分片 DB
+# 合并 worker .bin 文件
 # ============================================================
 
-def _merge_worker_dbs(workers: List[dict], main_db_path: str,
-                      attacker_color: int, first_turn: int) -> None:
-    main_db = _init_db(main_db_path)
+def _merge_worker_bins(workers: List[dict], main_bin_path: str,
+                       attacker_color: int, first_turn: int) -> None:
+    """读所有 worker .bin → dict 去重 → 写主 .bin + header。"""
+    merged_tt: Dict[tuple, Tuple[int, int]] = {}
     child_results = []
+
     for w in workers:
-        if not os.path.exists(w["db"]):
-            continue
-        wdb = sqlite3.connect(w["db"])
-        cur = wdb.cursor()
-        rows = cur.execute("SELECT key, pn, dn FROM tt").fetchall()
-        cur.close()
-        if rows:
-            mc = main_db.cursor()
-            mc.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)", rows)
-            mc.close()
-        cur2 = wdb.cursor()
-        results = cur2.execute("SELECT move, pn, dn FROM results").fetchall()
-        cur2.close()
-        child_results.extend(results)
-        wdb.close()
-    main_db.commit()
+        # 读 TT records（后覆盖前，自动去重）
+        wtt = _read_records(w["bin"])
+        merged_tt.update(wtt)
+        # 读 child results
+        results_path = w["bin"] + ".results.json"
+        try:
+            with open(results_path) as rf:
+                for move_str, pn, dn, nodes in json.load(rf):
+                    child_results.append((move_str, pn, dn))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
 
     # 计算根 pn/dn
     is_or = (first_turn == attacker_color)
     if child_results:
         if is_or:
             root_pn = min(pn for _, pn, _ in child_results)
-            root_dn = min(sum(dn for _, _, dn in child_results), 10**9)
+            root_dn = min(sum(dn for _, _, dn in child_results), DFPN_INF)
         else:
-            root_pn = min(sum(pn for _, pn, _ in child_results), 10**9)
+            root_pn = min(sum(pn for _, pn, _ in child_results), DFPN_INF)
             root_dn = min(dn for _, _, dn in child_results)
     else:
-        root_pn, root_dn = 10**9, 10**9
+        root_pn, root_dn = DFPN_INF, DFPN_INF
 
     result_str = "ATTACKER_WINS" if root_pn == 0 else (
         "DEFENDER_WINS" if root_dn == 0 else "UNPROVEN")
 
-    _set_meta(main_db, "status", "done")
-    _set_meta(main_db, "result", result_str)
-    _set_meta(main_db, "root_pn", str(root_pn))
-    _set_meta(main_db, "root_dn", str(root_dn))
-    cur3 = main_db.cursor()
-    total_tt = cur3.execute("SELECT COUNT(*) FROM tt").fetchone()[0]
-    cur3.close()
-    _set_meta(main_db, "tt_size", str(total_tt))
-    main_db.commit()
-    main_db.close()
+    # 写主 .bin
+    os.makedirs(os.path.dirname(main_bin_path) or ".", exist_ok=True)
+    with open(main_bin_path, "wb") as f:
+        _write_header(f, status=1, result=_RESULT_MAP.get(result_str, 0),
+                      count=len(merged_tt), root_pn=min(root_pn, 0xFFFFFFFF),
+                      root_dn=min(root_dn, 0xFFFFFFFF))
+        for key, (pn, dn) in merged_tt.items():
+            zh, turn, lc = key
+            f.write(struct.pack(_RECORD_FMT,
+                                zh, turn, lc if lc >= 0 else 255,
+                                _encode_pn(pn), _encode_pn(dn)))
+
+    # 清理 worker 临时文件
+    for w in workers:
+        for path in (w["bin"], w["bin"] + ".results.json", w["progress"]):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 # ============================================================
@@ -327,11 +363,9 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
                             kill_targets: List[List[int]],
                             defend_targets: List[List[int]],
                             attacker_color: int, first_turn: int,
-                            db_path: str, progress_path: str,
+                            bin_path: str, progress_path: str,
                             num_workers: Optional[int] = None) -> None:
-    """
-    coordinator：生成根候选 → 分配到 W 个 worker → 等待 → 合并。
-    """
+    """coordinator：生成根候选 → 分配到 W 个 worker → 等待 → 合并。"""
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
 
@@ -351,17 +385,15 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     root_moves = [m for m, _ in root_kids if m is not None]
 
     if not root_moves:
-        db = _init_db(db_path)
-        _set_meta(db, "status", "done")
-        _set_meta(db, "result", "DEFENDER_WINS")
-        _set_meta(db, "root_pn", str(10**9))
-        _set_meta(db, "root_dn", "0")
-        db.commit(); db.close()
+        os.makedirs(os.path.dirname(bin_path) or ".", exist_ok=True)
+        with open(bin_path, "wb") as f:
+            _write_header(f, status=1, result=_RESULT_MAP["DEFENDER_WINS"],
+                          count=0, root_pn=0xFFFFFFFF, root_dn=0)
         with open(progress_path, "w") as f:
             json.dump({"status": "done", "total_nodes": 0}, f)
         return
 
-    # LPT 调度：浅探估算难度，按难度降序交替分配
+    # LPT 调度
     difficulty = []
     for mx, my in root_moves:
         u = board.play_undoable(mx, my, first_turn)
@@ -384,24 +416,24 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
         buckets[i % num_workers].append(move)
 
     # 启动 workers
-    cache_dir = os.path.dirname(db_path) or "."
-    job_id = os.path.splitext(os.path.basename(db_path))[0]
+    cache_dir = os.path.dirname(bin_path) or "."
+    job_id = os.path.splitext(os.path.basename(bin_path))[0]
     workers = []
     start_time = time.monotonic()
     for wi in range(num_workers):
         if not buckets[wi]:
             continue
-        wdb = os.path.join(cache_dir, f"{job_id}_w{wi}.db")
+        wbin = os.path.join(cache_dir, f"{job_id}_w{wi}.bin")
         wprog = os.path.join(cache_dir, f"{job_id}_w{wi}_progress.json")
         p = mp.Process(target=_worker_solve, args=(
             board_grid, last_capture, region,
             kill_targets, defend_targets, attacker_color, first_turn,
-            buckets[wi], wdb, wprog,
+            buckets[wi], wbin, wprog,
         ))
         p.start()
-        workers.append({"process": p, "db": wdb, "progress": wprog})
+        workers.append({"process": p, "bin": wbin, "progress": wprog})
 
-    # 写 worker PID 文件（供外部终止）
+    # 写 worker PID 文件
     pids_path = os.path.join(cache_dir, f"{job_id}_pids.json")
     try:
         with open(pids_path, "w") as f:
@@ -416,12 +448,17 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     _aggregate_progress(workers, progress_path, start_time)
 
     # 合并
-    _merge_worker_dbs(workers, db_path, attacker_color, first_turn)
+    _merge_worker_bins(workers, bin_path, attacker_color, first_turn)
+
+    # 清理 pids 文件
+    try:
+        os.remove(pids_path)
+    except OSError:
+        pass
 
     # 最终进度
     with open(progress_path, "w") as f:
-        json.dump({"status": "done", "total_nodes": 0,
-                   "message": "merged"}, f)
+        json.dump({"status": "done", "total_nodes": 0, "message": "merged"}, f)
 
 
 # ============================================================
