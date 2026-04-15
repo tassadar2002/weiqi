@@ -173,7 +173,8 @@ class BinCache:
 
 ## 涉及文件
 
-- `backend/precompute.py` — 二进制格式定义、BinCache、Worker 写入、k-way 合并
+- `backend/bincache.py` — 二进制格式定义、BinCache mmap 查表、k-way 合并
+- `backend/precompute.py` — Worker 写入、coordinator 并行调度
 - `backend/server.py` — 使用 BinCache 查表
 - `backend/board.py` — Zobrist hash、rebuild_zh()
 - `backend/solver.py` — tt_log 增量记录

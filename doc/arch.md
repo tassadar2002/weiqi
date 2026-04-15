@@ -42,9 +42,9 @@
   布局 → 设置落子点 → 设定目标 → 确认 → 保存 → 返回列表
 
 命令行预处理：
-  python3 backend/precompute.py list              # 列出所有题目
-  python3 backend/precompute.py run <problem_id>  # 运行预处理（自动切换 pypy3）
-  python3 backend/precompute.py status <problem_id>  # 查看进度/结果
+  python3 backend/cli_precompute.py list              # 列出所有题目
+  python3 backend/cli_precompute.py run <problem_id>  # 运行预处理（自动切换 pypy3）
+  python3 backend/cli_precompute.py status <problem_id>  # 查看进度/结果
                                               ↓
                                     多进程并行穷举 df-pn
                                     终端实时显示进度
@@ -77,7 +77,9 @@
 │  board.js   [极简数据]    │  /api/solve            │  eyes.py    真眼判定          │
 │  region.js  [区域掩码]    │  /api/validate_target  │  target.py  目标构造          │
 │  api.js     [fetch 包装] │                        │  solver.py  df-pn 求解器      │
-│  renderer.js [Canvas]    │                        │  precompute.py 多进程预处理(CLI) │
+│  renderer.js [Canvas]    │                        │  precompute.py 多进程预处理      │
+│                          │                        │  bincache.py   二进制缓存+查表   │
+│                          │                        │  cli_precompute.py 预处理CLI     │
 │  app.js     [FSM 控制]   │ ←──────────────────   │  problems.py 习题 CRUD        │
 └──────────────────────────┘                        └──────────────────────────────┘
 ```
@@ -86,7 +88,7 @@
 
 | 模式 | 触发 | 过程 | 结果 |
 |---|---|---|---|
-| **预处理（主要）** | 命令行 `precompute.py run` | 多进程无限制穷举 → 全量 TT 写入二进制缓存 (.bin) | 永久缓存，毫秒级查询 |
+| **预处理（主要）** | 命令行 `cli_precompute.py run` | 多进程无限制穷举 → 全量 TT 写入二进制缓存 (.bin) | 永久缓存，毫秒级查询 |
 | **查表（预处理后）** | 用户点"最优解" | mmap 打开 .bin → 二分查找 pn/dn → 遍历子节点找 pn=0 的着 | 不跑 df-pn，纯查表 |
 
 **预处理完成后的查询不需要**：跨请求 TT 缓存、vitalness 破平、走法排序、穷举根证明、顽抗着选择。这些仅在"在线实时求解"场景下有用，预处理模式下全部冗余。
@@ -278,13 +280,13 @@ def solve_from_cache(tt, board, turn, region_mask, kill_targets, defend_targets,
 
 ```bash
 # 启动预处理（自动切换 pypy3）
-python3 backend/precompute.py run <problem_id>
+python3 backend/cli_precompute.py run <problem_id>
 
 # 运行中实时输出：
   计算中 3:42  节点=   1,234,567  TT=     890,123   15,432 n/s  进程 3/3
 
 # 另开终端查看状态（含每个 worker 明细）：
-python3 backend/precompute.py status <problem_id>
+python3 backend/cli_precompute.py status <problem_id>
 ```
 
 - coordinator 每 2 秒汇总 worker 进度到 `{job_id}_progress.json`
@@ -378,12 +380,14 @@ CREATE TABLE problems (
 预处理不再通过 HTTP API 触发，改为命令行工具：
 
 ```bash
-python3 backend/precompute.py list                    # 列出所有题目
-python3 backend/precompute.py status <problem_id>     # 查看预处理状态（含 worker 明细）
-python3 backend/precompute.py run <problem_id> [-w N] # 运行预处理（N=worker数）
+python3 backend/cli_precompute.py list                    # 列出所有题目
+python3 backend/cli_precompute.py status <problem_id>     # 查看预处理状态（含 worker 明细）
+python3 backend/cli_precompute.py run <problem_id> [-w N] # 运行预处理（N=worker数）
 ```
 
 `run` 命令自动检测并切换到 pypy3 执行（强制要求安装 pypy3）。
+
+`list` 和 `status` 可用 python3 运行（只读 DB/文件），`run` 强制 pypy3。
 
 ---
 
@@ -406,7 +410,9 @@ weiqi3/
 │   ├── eyes.py              严格真眼判定（绑定特定群）
 │   ├── target.py            validate_target_stone
 │   ├── solver.py            DfpnSolver（df-pn + TT + 多目标终止 + 进度回调）
-│   ├── precompute.py        多进程并行预处理 + 二进制缓存 + 查表求解 + CLI 入口
+│   ├── bincache.py          二进制缓存格式 + BinCache mmap 查表 + k-way 合并
+│   ├── precompute.py        多进程并行预处理（worker + coordinator）
+│   ├── cli_precompute.py    预处理 CLI（list/status/run）
 │   ├── problems.py          习题 CRUD（problems.db 读写）
 │   ├── data/                习题数据库目录
 │   │   └── problems.db
@@ -574,5 +580,5 @@ print(r['result'], r['nodes'])
 ### 前端
 
 1. 首页 → 新建习题 → 布局 → 设区域 → 选目标 → 确认 → 保存 → 返回列表
-2. 命令行：`python3 backend/precompute.py run <id>` → 观察实时进度 → 完成
+2. 命令行：`python3 backend/cli_precompute.py run <id>` → 观察实时进度 → 完成
 3. 进入习题 → 解题 → 最优解 → 秒出 → 自动对弈 → 终局

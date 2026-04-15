@@ -32,7 +32,9 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 │  server.py: HTTP service (http.server stdlib)  │
 │  ├─ board.py: rules engine + undo-stack        │
 │  ├─ solver.py: df-pn main loop + TT            │
-│  ├─ precompute.py: multi-process cache builder │
+│  ├─ bincache.py: binary cache format + lookup  │
+│  ├─ precompute.py: multi-process coordinator   │
+│  ├─ cli_precompute.py: precompute CLI          │
 │  ├─ problems.py: problem CRUD (SQLite)         │
 │  ├─ eyes.py: strict true-eye detection         │
 │  └─ target.py: target validation               │
@@ -51,9 +53,9 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 
 4. **Epoch-based visited tracking**: Module-level `bytearray` + epoch counter replaces `Set` allocation per traversal.
 
-5. **Multi-process root-splitting** (`precompute.py`): Coordinator generates root candidates; each worker solves assigned subtree → worker-local SQLite → merge. Avoids lock contention.
+5. **Multi-process root-splitting** (`precompute.py`): Coordinator generates root candidates; each worker solves assigned subtree → worker-local .bin → merge. Avoids lock contention.
 
-6. **Binary TT cache format** (`precompute.py`): Sorted 12-byte records (8B key + 2B pn + 2B dn) in `.bin` files; mmap + binary search for O(log n) lookup with ~0 memory overhead.
+6. **Binary TT cache format** (`bincache.py`): Sorted 12-byte records (8B key + 2B pn + 2B dn) in `.bin` files; mmap + binary search for O(log n) lookup with ~0 memory overhead.
 
 7. **Stateless HTTP API**: Each request includes full board state (169 integers for 13×13). No per-session state on backend; enables horizontal scaling and resilience.
 
@@ -72,7 +74,7 @@ layout (place stones) ──[next]──> region (set playable area) ──[next
 ```
 
 The solver supports two phases:
-- **Precompute phase**: CLI command `python3 backend/precompute.py run <problem_id>` (auto-switches to pypy3)
+- **Precompute phase**: CLI command `python3 backend/cli_precompute.py run <problem_id>` (auto-switches to pypy3)
 - **Lookup phase**: After precompute done, clicking "最优解" calls `/api/solve` for instant table lookup
 
 ### Data Flow
@@ -81,7 +83,7 @@ The solver supports two phases:
 2. User sets region → region_mask (169 ints: 0/1)
 3. User picks target stone → validated via `POST /api/validate_target` → target_info (group, libs, eyes, attacker_color)
 4. User confirms target → auto-save → back to list
-5. CLI: `precompute.py run <id>` → spawns workers, each writes sorted `.bin` shard → k-way merge → final `{job_id}.bin`
+5. CLI: `cli_precompute.py run <id>` → spawns workers, each writes sorted `.bin` shard → k-way merge → final `{job_id}.bin`
 6. User clicks "最优解" → `POST /api/solve` mmap-opens cache, binary-search lookups best move
 7. User plays moves → `POST /api/play` updates board, checks legality, reports captures
 
@@ -99,10 +101,10 @@ Then open `http://localhost:8080/` in browser.
 ### Precompute (CLI)
 
 ```bash
-python3 backend/precompute.py list                        # List all problems
-python3 backend/precompute.py status <problem_id>         # Check precompute status (with worker details)
-python3 backend/precompute.py run <problem_id>            # Run precompute (auto-switches to pypy3)
-python3 backend/precompute.py run <problem_id> -w 4       # Specify worker count
+python3 backend/cli_precompute.py list                        # List all problems
+python3 backend/cli_precompute.py status <problem_id>         # Check precompute status (with worker details)
+python3 backend/cli_precompute.py run <problem_id>            # Run precompute (auto-switches to pypy3)
+python3 backend/cli_precompute.py run <problem_id> -w 4       # Specify worker count
 ```
 
 ### Run Tests
@@ -178,7 +180,9 @@ The solver terminates a branch when:
 | `server.py` | HTTP server, route handlers, cache lookup for solve |
 | `board.py` | Board state, play/undo, group+libs, legal move generation |
 | `solver.py` | df-pn main loop, transposition table, termination checks |
-| `precompute.py` | Multi-process solver, binary cache format, merge logic, CLI entry point (list/status/run) |
+| `bincache.py` | Binary cache format (.bin), BinCache mmap lookup, solve_from_cache, k-way merge |
+| `precompute.py` | Multi-process worker + coordinator (parallel scheduling, progress monitoring) |
+| `cli_precompute.py` | Precompute CLI entry point (list/status/run), progress display, pypy3 switch |
 | `problems.py` | SQLite schema + CRUD for problem persistence |
 | `eyes.py` | True eye detection (group-specific) |
 | `target.py` | Validate target stone → group representation |
@@ -347,7 +351,7 @@ Key points:
 
 4. **TT key mismatch**: If precompute uses different key generation than lookup, cache misses occur silently (looks slow, not wrong).
 
-5. **PyPy3 required for precompute**: `precompute.py run` enforces pypy3 (auto-detects and exec's). Must have pypy3 installed; no python3 fallback for precompute.
+5. **PyPy3 required for precompute**: `cli_precompute.py run` enforces pypy3 (auto-detects and exec's). Must have pypy3 installed; no python3 fallback for precompute.
 
 ## References
 
