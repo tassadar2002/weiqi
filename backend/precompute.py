@@ -322,7 +322,6 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
     root_moves = [m for m, _ in root_kids if m is not None]
 
     if not root_moves:
-        # 无合法走法 → 直接写结果
         db = _init_db(db_path)
         _set_meta(db, "status", "done")
         _set_meta(db, "result", "DEFENDER_WINS")
@@ -333,9 +332,26 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
             json.dump({"status": "done", "total_nodes": 0}, f)
         return
 
-    # 分桶
+    # LPT 调度：浅探估算难度，按难度降序交替分配
+    difficulty = []
+    for mx, my in root_moves:
+        u = board.play_undoable(mx, my, first_turn)
+        if u is None:
+            difficulty.append(0)
+            continue
+        probe = DfpnSolver(
+            board, region, attacker_color=attacker_color,
+            kill_targets=[tuple(c) for c in kill_targets],
+            defend_targets=[tuple(c) for c in defend_targets],
+            max_nodes=500, max_time_ms=200,
+        )
+        r = probe.solve(-first_turn)
+        difficulty.append(r["nodes"] if r["result"] == "UNPROVEN" else 0)
+        board.undo(u)
+
+    sorted_moves = sorted(zip(difficulty, root_moves), reverse=True)
     buckets: List[List[Tuple[int, int]]] = [[] for _ in range(num_workers)]
-    for i, move in enumerate(root_moves):
+    for i, (_, move) in enumerate(sorted_moves):
         buckets[i % num_workers].append(move)
 
     # 启动 workers
