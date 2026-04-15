@@ -18,7 +18,7 @@
 | **习题管理** | 首页列表展示所有题目；可新建、编辑、删除；每题独立存储 |
 | **布局编辑** | 13×13 棋盘，自由放置黑白子，设定可落子区域 |
 | **多目标指定** | 点白子=杀目标(红高亮)，点黑子=守目标(蓝高亮) |
-| **预处理穷举** | 后台多进程并行 df-pn（无限制），增量写入 SQLite，完成后结果永久缓存 |
+| **预处理穷举** | 命令行多进程并行 df-pn（无限制），增量写入二进制缓存，完成后结果永久缓存 |
 | **秒出最优解** | 预处理完成后，直接查 TT 缓存，毫秒级返回严格最优着 |
 | **自动对弈** | 双方按证明树落子到棋盘真正终局 |
 | **决策日志** | 每步显示攻/防角色、必胜/顽抗标签、节点数、耗时 |
@@ -28,7 +28,6 @@
 **"先穷举，后查表"** —— 不追求在线实时求解的速度优化，而是靠预处理一次性算完+缓存。
 
 结果是：
-- 不需要 PyPy、不需要 Cython、不需要任何运行时性能优化
 - 只需要耐心等待预处理完成（分钟到小时级）
 - 完成后每一步都是严格最优、毫秒级响应
 
@@ -40,13 +39,18 @@
   └─ [点击某题] → 加载已有布局
 
 习题详情页：
-  布局 → 设置落子点 → 设定目标 → 确认 → 开始预处理
+  布局 → 设置落子点 → 设定目标 → 确认 → 保存 → 返回列表
+
+命令行预处理：
+  python3 backend/precompute.py list              # 列出所有题目
+  python3 backend/precompute.py run <problem_id>  # 运行预处理（自动切换 pypy3）
+  python3 backend/precompute.py status <problem_id>  # 查看进度/结果
                                               ↓
-                                    后台多进程并行穷举 df-pn
-                                    前端每 2 秒轮询显示进度
-                                    TT 条目增量写入 SQLite
+                                    多进程并行穷举 df-pn
+                                    终端实时显示进度
+                                    TT 条目增量写入二进制缓存
                                               ↓
-                                    预处理完成 → "最优解"秒出
+                                    预处理完成 → 浏览器"最优解"秒出
 ```
 
 ### 1.5 约束
@@ -72,8 +76,8 @@
 │  style.css               │  /api/play             │  board.py   规则引擎          │
 │  board.js   [极简数据]    │  /api/solve            │  eyes.py    真眼判定          │
 │  region.js  [区域掩码]    │  /api/validate_target  │  target.py  目标构造          │
-│  api.js     [fetch 包装] │  /api/precompute/*     │  solver.py  df-pn 求解器      │
-│  renderer.js [Canvas]    │                        │  precompute.py 多进程预处理   │
+│  api.js     [fetch 包装] │                        │  solver.py  df-pn 求解器      │
+│  renderer.js [Canvas]    │                        │  precompute.py 多进程预处理(CLI) │
 │  app.js     [FSM 控制]   │ ←──────────────────   │  problems.py 习题 CRUD        │
 └──────────────────────────┘                        └──────────────────────────────┘
 ```
@@ -82,8 +86,8 @@
 
 | 模式 | 触发 | 过程 | 结果 |
 |---|---|---|---|
-| **预处理（主要）** | 用户点"开始预处理" | 后台多进程无限制穷举 → 全量 TT 写入 SQLite | 永久缓存，毫秒级查询 |
-| **查表（预处理后）** | 用户点"最优解" | 从 SQLite 加载 TT → 查根 pn/dn → 遍历子节点找 pn=0 的着 | 不跑 df-pn，纯查表 |
+| **预处理（主要）** | 命令行 `precompute.py run` | 多进程无限制穷举 → 全量 TT 写入二进制缓存 (.bin) | 永久缓存，毫秒级查询 |
+| **查表（预处理后）** | 用户点"最优解" | mmap 打开 .bin → 二分查找 pn/dn → 遍历子节点找 pn=0 的着 | 不跑 df-pn，纯查表 |
 
 **预处理完成后的查询不需要**：跨请求 TT 缓存、vitalness 破平、走法排序、穷举根证明、顽抗着选择。这些仅在"在线实时求解"场景下有用，预处理模式下全部冗余。
 
@@ -92,8 +96,8 @@
 | 存储 | 位置 | 用途 |
 |---|---|---|
 | 习题数据库 | `backend/data/problems.db` | 习题的布局、区域、目标、状态 |
-| 预处理缓存 | `backend/cache/{job_id}.db` | 每题的完整 TT（proof/disproof 数表） |
-| 预处理进度 | `backend/cache/{job_id}_progress.json` | 实时进度（前端轮询） |
+| 预处理缓存 | `backend/cache/{job_id}.bin` | 每题的完整 TT（排序二进制记录，mmap 查询） |
+| 预处理进度 | `backend/cache/{job_id}_progress.json` | 实时进度（CLI 终端 / status 命令读取） |
 
 全部 SQLite + JSON，无需任何数据库服务。
 
@@ -138,7 +142,7 @@
 
 | 特性 | 预处理时 | 查表时 | 说明 |
 |---|---|---|---|
-| 转置表 (TT) | 需要 | 从 SQLite 加载 | df-pn 的核心数据结构 |
+| 转置表 (TT) | 需要 | 从 .bin 缓存 mmap 加载 | df-pn 的核心数据结构 |
 | 走法排序 | 需要 | 不需要 | 好的排序加快穷举收敛 |
 | `try/finally` play/undo | 需要 | 不需要 | 防止异常导致棋盘脏 |
 | `progress_callback` | 需要 | 不需要 | 报告穷举进度 |
@@ -244,7 +248,7 @@ def solve_from_cache(tt, board, turn, region_mask, kill_targets, defend_targets,
 
 ### 4.1 目的
 
-对任意大小区域（包括空位 > 30）的题目，后台无限制穷举 df-pn，结果缓存到 SQLite。
+对任意大小区域（包括空位 > 30）的题目，命令行无限制穷举 df-pn，结果缓存到二进制文件 (.bin)。
 
 ### 4.2 多进程并行策略：根节点分裂
 
@@ -257,37 +261,36 @@ def solve_from_cache(tt, board, turn, region_mask, kill_targets, defend_targets,
 ```
 
 - 主进程（coordinator）：生成根候选 → 分配到 W 个 worker → 等待完成 → 合并
-- 每个 worker：对分到的子节点逐个跑 df-pn → 增量写入自己的 SQLite 分片
-- 完成后：合并分片 → 计算根 pn/dn → 写最终结果
-- `num_workers = cpu_count() - 1`（留 1 核给 HTTP 服务）
+- 每个 worker：对分到的子节点逐个跑 df-pn → 增量写入自己的排序 .bin 分片
+- 完成后：k-way 归并分片 → 计算根 pn/dn → 写最终 .bin
+- `num_workers = cpu_count() - 1`
 
-### 4.3 增量存储（SQLite，随算随存）
+### 4.3 增量存储（二进制，随算随存）
 
-```sql
--- 每个 worker 分片 DB + 合并后的主 DB 都用此 schema
-CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE tt (key TEXT PRIMARY KEY, pn INTEGER, dn INTEGER);
-PRAGMA journal_mode=WAL;
-```
-
-- 每 10K 新 TT 条目 → `executemany` batch insert → `commit()`
-- 进程崩溃 → 最多丢最近一次 checkpoint 的 10K 条目，已 commit 的安全
-- 每个 worker 写自己的 `{job_id}_w{i}.db` → 无锁竞争
-- 完成后合并到 `{job_id}.db`
+- 每 10K 新 TT 条目 → 追加写入临时 .bin 文件
+- Worker 完成后将内存 TT 排序去重，写入最终有序 .bin
+- 每个 worker 写自己的 `{job_id}_w{i}.bin` → 无锁竞争
+- 完成后 k-way 归并到 `{job_id}.bin`
 
 ### 4.4 进度显示
 
-df-pn 无法预估总节点数（pn/dn 不线性收敛）。显示**收敛趋势指标**：
+预处理通过命令行启动和监控：
 
-```
-计算中... 3/7 进程
-已搜 2,345,678 节点 · 12,500 n/s · 3 分 07 秒
-TT 新增速率：↓ 2,100/s（递减 = 趋近收敛）
+```bash
+# 启动预处理（自动切换 pypy3）
+python3 backend/precompute.py run <problem_id>
+
+# 运行中实时输出：
+  计算中 3:42  节点=   1,234,567  TT=     890,123   15,432 n/s  进程 3/3
+
+# 另开终端查看状态（含每个 worker 明细）：
+python3 backend/precompute.py status <problem_id>
 ```
 
-- 不显示百分比进度条
-- 用不确定动画（条纹滚动）
-- TT 新增速率递减 = 正在收敛
+- coordinator 每 2 秒汇总 worker 进度到 `{job_id}_progress.json`
+- `run` 命令后台线程读取进度文件，单行刷新终端
+- `status` 命令可在任意时刻查看：总进度 + 每个 worker 的节点数、TT、用时、PID、状态
+- coordinator 监控 worker 异常退出（exitcode != 0），记录日志，合并时跳过失败 worker
 
 ### 4.5 solver 预处理模式配置
 
@@ -336,7 +339,7 @@ CREATE TABLE problems (
 两视图 SPA（同一 index.html，JS 切换 `#list-view` / `#detail-view`）：
 
 - **列表视图**：标题 + "+ 新建习题" + 习题卡片列表（名称、子数、区域格数、预处理状态）
-- **详情视图**：`← 返回列表 | 保存 | 删除` + 棋盘界面 + 预处理按钮
+- **详情视图**：`← 返回列表 | 保存 | 删除` + 棋盘界面（布局/区域/目标设置）
 
 ---
 
@@ -368,15 +371,19 @@ CREATE TABLE problems (
 |---|---|---|
 | `POST /api/solve` | `{board, last_capture, region, target: {kill_targets_coords, defend_targets_coords, attacker_color}, turn, precompute_cache_id}` | `{result, move, multi_status}` |
 
-预处理完成后的 solve **不跑 df-pn**，只从 SQLite 加载 TT + 查表。响应中没有 nodes/elapsed_ms/pn/dn（因为不搜索）。
+预处理完成后的 solve **不跑 df-pn**，只从 .bin 缓存 mmap 查表。响应中没有 nodes/elapsed_ms/pn/dn（因为不搜索）。
 
-### 6.4 预处理
+### 6.4 预处理（命令行）
 
-| 端点 | 请求 | 响应 |
-|---|---|---|
-| `POST /api/precompute/start` | `{board, region, kill_targets, defend_targets, attacker_color, turn}` | `{job_id, workers}` |
-| `POST /api/precompute/status` | `{job_id}` | `{status, total_nodes, workers_active, workers_total, tt_rate}` |
-| `POST /api/precompute/stop` | `{job_id}` | `{ok}` |
+预处理不再通过 HTTP API 触发，改为命令行工具：
+
+```bash
+python3 backend/precompute.py list                    # 列出所有题目
+python3 backend/precompute.py status <problem_id>     # 查看预处理状态（含 worker 明细）
+python3 backend/precompute.py run <problem_id> [-w N] # 运行预处理（N=worker数）
+```
+
+`run` 命令自动检测并切换到 pypy3 执行（强制要求安装 pypy3）。
 
 ---
 
@@ -391,7 +398,7 @@ weiqi3/
 │   ├── region.js            落子区域掩码工具
 │   ├── api.js               后端 API 客户端（fetch 包装）
 │   ├── renderer.js          Canvas 渲染：棋子、序号、多色目标高亮
-│   └── app.js               FSM 控制 + 决策日志 + 习题列表 + 预处理 UI
+│   └── app.js               FSM 控制 + 决策日志 + 习题列表
 │
 ├── backend/
 │   ├── server.py            HTTP 服务（stdlib http.server）+ 所有路由
@@ -399,14 +406,16 @@ weiqi3/
 │   ├── eyes.py              严格真眼判定（绑定特定群）
 │   ├── target.py            validate_target_stone
 │   ├── solver.py            DfpnSolver（df-pn + TT + 多目标终止 + 进度回调）
-│   ├── precompute.py        多进程并行预处理 + SQLite 增量写入 + 查表求解
+│   ├── precompute.py        多进程并行预处理 + 二进制缓存 + 查表求解 + CLI 入口
 │   ├── problems.py          习题 CRUD（problems.db 读写）
 │   ├── data/                习题数据库目录
 │   │   └── problems.db
 │   ├── cache/               预处理缓存目录
-│   │   ├── {job_id}.db                每题的完整 TT（SQLite）
-│   │   ├── {job_id}_w{i}.db           worker 分片（完成后可删）
-│   │   └── {job_id}_progress.json     实时进度
+│   │   ├── {job_id}.bin               每题的完整 TT（排序二进制，mmap 查询）
+│   │   ├── {job_id}_w{i}.bin          worker 分片（合并后自动删除）
+│   │   ├── {job_id}_w{i}_progress.json  worker 实时进度
+│   │   ├── {job_id}_progress.json     汇总进度（含 worker 快照）
+│   │   └── {job_id}_pids.json         worker PID 列表（完成后删除）
 │   └── README.md
 │
 ├── arch.md                  本文件（完整架构，可据此复刻）
@@ -502,16 +511,14 @@ App.mode:
 ```
 
 ```
-layout ──[下一步]──→ region ──[下一步]──→ solve
+layout ──[下一步]──→ region ──[下一步]──→ pick-target
                                            │
-                                     自动进入 pick-target
-                                           │
-                                     点选目标 → [确认]
-                                           │
-                                     回到 solve
-                                           │
-                                ┌──── [最优解] ────→ autoplay（查表）
-                                └──── [预处理] ────→ precompute → done → [最优解]
+                                     点选目标 → [确认] → 保存 → 返回列表
+                                     
+                                     (命令行运行预处理后)
+
+                                     列表 → [解题] → solve → [最优解] → autoplay（查表）
+
 任何阶段 ──[返回布局]──→ layout
 任何阶段 ──[← 返回列表]──→ list-view
 ```
@@ -566,6 +573,6 @@ print(r['result'], r['nodes'])
 
 ### 前端
 
-1. 首页 → 新建习题 → 布局 → 保存 → 返回列表 → 卡片出现
-2. 进入习题 → 设区域 → 选目标 → 预处理 → 进度显示 → 完成
-3. 最优解 → 秒出 → 自动对弈 → 终局
+1. 首页 → 新建习题 → 布局 → 设区域 → 选目标 → 确认 → 保存 → 返回列表
+2. 命令行：`python3 backend/precompute.py run <id>` → 观察实时进度 → 完成
+3. 进入习题 → 解题 → 最优解 → 秒出 → 自动对弈 → 终局

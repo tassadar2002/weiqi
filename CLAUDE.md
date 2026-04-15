@@ -66,17 +66,13 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 ### Frontend FSM States
 
 ```
-layout (place stones) ──[next]──> region (set playable area) ──[next]──> solve
+layout (place stones) ──[next]──> region (set playable area) ──[next]──> pick-target
                                                                            │
-                                                                  auto-enter pick-target
-                                                                           │
-                                                    user clicks stone → confirm
-                                                                           │
-                                                                      back to solve
+                                                    user clicks stone → confirm → save → list view
 ```
 
 The solver supports two phases:
-- **Precompute phase**: Background multi-process exhaustion; frontend polls `/api/precompute/status` every 2 sec
+- **Precompute phase**: CLI command `python3 backend/precompute.py run <problem_id>` (auto-switches to pypy3)
 - **Lookup phase**: After precompute done, clicking "最优解" calls `/api/solve` for instant table lookup
 
 ### Data Flow
@@ -84,8 +80,8 @@ The solver supports two phases:
 1. User lays out stones → board_grid (169 ints: -1/0/1 for white/empty/black)
 2. User sets region → region_mask (169 ints: 0/1)
 3. User picks target stone → validated via `POST /api/validate_target` → target_info (group, libs, eyes, attacker_color)
-4. User clicks "precompute start" → spawns workers, each writes sorted `.bin` shard
-5. Workers complete → k-way merge shards → final `{job_id}.bin`
+4. User confirms target → auto-save → back to list
+5. CLI: `precompute.py run <id>` → spawns workers, each writes sorted `.bin` shard → k-way merge → final `{job_id}.bin`
 6. User clicks "最优解" → `POST /api/solve` mmap-opens cache, binary-search lookups best move
 7. User plays moves → `POST /api/play` updates board, checks legality, reports captures
 
@@ -99,6 +95,15 @@ PORT=9000 python3 backend/server.py    # Custom port
 ```
 
 Then open `http://localhost:8080/` in browser.
+
+### Precompute (CLI)
+
+```bash
+python3 backend/precompute.py list                        # List all problems
+python3 backend/precompute.py status <problem_id>         # Check precompute status (with worker details)
+python3 backend/precompute.py run <problem_id>            # Run precompute (auto-switches to pypy3)
+python3 backend/precompute.py run <problem_id> -w 4       # Specify worker count
+```
 
 ### Run Tests
 
@@ -170,10 +175,10 @@ The solver terminates a branch when:
 
 | File | Purpose |
 |------|---------|
-| `server.py` | HTTP server, route handlers, job management for precompute |
+| `server.py` | HTTP server, route handlers, cache lookup for solve |
 | `board.py` | Board state, play/undo, group+libs, legal move generation |
 | `solver.py` | df-pn main loop, transposition table, termination checks |
-| `precompute.py` | Multi-process solver, binary cache format, merge logic |
+| `precompute.py` | Multi-process solver, binary cache format, merge logic, CLI entry point (list/status/run) |
 | `problems.py` | SQLite schema + CRUD for problem persistence |
 | `eyes.py` | True eye detection (group-specific) |
 | `target.py` | Validate target stone → group representation |
@@ -183,7 +188,7 @@ The solver terminates a branch when:
 
 | File | Purpose |
 |------|---------|
-| `app.js` | FSM control, event handlers, async API calls, decision log UI |
+| `app.js` | FSM control, event handlers, async API calls, decision log UI (no precompute UI) |
 | `board.js` | ClientBoard: minimal grid container (no rules) |
 | `api.js` | Fetch wrappers for /api/* endpoints |
 | `renderer.js` | Canvas drawing: stones, grid, annotations, highlights |
@@ -342,7 +347,7 @@ Key points:
 
 4. **TT key mismatch**: If precompute uses different key generation than lookup, cache misses occur silently (looks slow, not wrong).
 
-5. **Python/PyPy path**: Precompute defaults to `pypy3` if available; ensure it's installed for speed. Fall-back to `python3` is safe but slow.
+5. **PyPy3 required for precompute**: `precompute.py run` enforces pypy3 (auto-detects and exec's). Must have pypy3 installed; no python3 fallback for precompute.
 
 ## References
 

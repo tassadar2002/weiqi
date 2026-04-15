@@ -211,7 +211,7 @@ kids = self._gen_children(turn, allow_pass=not is_or, depth=depth)
 
 1. 单元测试：用已知题目跑 solver，对比优化前后的 result（必须一致）
 2. 性能对比：同一题目记录优化前后 nodes/sec
-3. 预处理端到端：启动预处理，观察前端进度显示的 n/s 指标
+3. 预处理端到端：`python3 backend/precompute.py run <id>`，观察终端进度显示的 n/s 指标
 4. 正确性：Zobrist hash 后 `solve_from_cache` 结果与原 string hash 一致
 
 ## 关键文件
