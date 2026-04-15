@@ -183,11 +183,11 @@ class DfpnSolver:
             if pn >= th_pn or dn >= th_dn: return
 
             if is_or:
-                th_pn_c = min(th_pn, second_best + 1)
+                th_pn_c = min(th_pn, int(second_best * 1.25) + 1)
                 th_dn_c = th_dn - dn + best_child_dn
             else:
                 th_pn_c = th_pn - pn + best_child_pn
-                th_dn_c = min(th_dn, second_best + 1)
+                th_dn_c = min(th_dn, int(second_best * 1.25) + 1)
 
             best_move, _ = kids[best_idx]
             handle = self._play_kid(best_move, turn)
