@@ -250,75 +250,136 @@ def _worker_solve(board_grid: List[int], last_capture: int,
                   my_moves: List[Tuple[int, int]],
                   bin_path: str, progress_path: str) -> None:
     """单个 worker：对分到的每个根候选着法跑 df-pn，最终输出排序去重的 .bin。"""
+    import sys as _sys
+
+    # 防递归溢出：max_depth=80，每层递归含 _mid + _check_limits 等帧，留 3x 余量
+    needed = 80 * 3 + 200
+    if _sys.getrecursionlimit() < needed:
+        _sys.setrecursionlimit(needed)
+
     board = Board(BOARD_SIZE)
     board.grid = list(board_grid)
     board.last_capture = last_capture
     board.rebuild_zh()
 
     os.makedirs(os.path.dirname(bin_path) or ".", exist_ok=True)
+    cache_dir = os.path.dirname(bin_path) or "."
+    job_base = os.path.splitext(os.path.basename(bin_path))[0]  # e.g. "{job_id}_w{i}"
+
     # 增量 append 文件（运行中崩溃安全）
     tmp_path = bin_path + ".tmp"
     f = open(tmp_path, "wb")
     _write_header(f, status=0)
 
     total_nodes = 0
+    total_tt_count = 0
     t0 = time.monotonic()
     BATCH = 10_000
     child_results = []
-    all_tt: Dict[tuple, Tuple[int, int]] = {}  # 跨 move 的合并 TT
+    move_bins = []  # 每个 move 的排序 .bin 路径（用于最终 k-way 合并）
 
-    for mx, my in my_moves:
-        u = board.play_undoable(mx, my, first_turn)
-        if u is None:
-            continue
+    try:
+        for mi, (mx, my) in enumerate(my_moves):
+            u = board.play_undoable(mx, my, first_turn)
+            if u is None:
+                continue
 
-        last_flush = 0
+            last_flush = 0
 
-        def on_progress(info):
-            nonlocal last_flush
-            new_count = len(solver.tt_log)
-            if new_count - last_flush >= BATCH:
-                last_flush = _flush_records(f, solver, last_flush)
-            info["status"] = "running"
-            info["total_nodes"] = total_nodes + info["nodes"]
-            info["current_move"] = [mx, my]
-            info["tt_flushed"] = last_flush
-            info["tt_size"] = len(solver.tt) + len(all_tt)
-            try:
-                with open(progress_path, "w") as pf:
-                    json.dump(info, pf)
-            except OSError:
-                pass
+            def on_progress(info):
+                nonlocal last_flush
+                new_count = len(solver.tt_log)
+                if new_count - last_flush >= BATCH:
+                    last_flush = _flush_records(f, solver, last_flush)
+                info["status"] = "running"
+                info["total_nodes"] = total_nodes + info["nodes"]
+                info["current_move"] = [mx, my]
+                info["tt_flushed"] = last_flush
+                info["tt_size"] = total_tt_count + len(solver.tt)
+                try:
+                    with open(progress_path, "w") as pf:
+                        json.dump(info, pf)
+                except OSError:
+                    pass
 
-        solver = DfpnSolver(
-            board, region,
-            attacker_color=attacker_color,
-            kill_targets=[tuple(c) for c in kill_targets],
-            defend_targets=[tuple(c) for c in defend_targets],
-            progress_callback=on_progress,
-        )
-        r = solver.solve(-first_turn)
-        total_nodes += r["nodes"]
+            solver = DfpnSolver(
+                board, region,
+                attacker_color=attacker_color,
+                kill_targets=[tuple(c) for c in kill_targets],
+                defend_targets=[tuple(c) for c in defend_targets],
+                progress_callback=on_progress,
+            )
+            r = solver.solve(-first_turn)
+            total_nodes += r["nodes"]
 
-        _flush_records(f, solver, last_flush)
-        child_results.append((f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
-        # 合并到 all_tt（去重）
-        all_tt.update(solver.tt)
-        board.undo(u)
+            _flush_records(f, solver, last_flush)
+            child_results.append((f"{mx},{my}", r["pn"], r["dn"], r["nodes"]))
 
-    f.close()
+            # 每个 move 完成后：排序写入独立 .bin，立即释放内存
+            move_bin = os.path.join(cache_dir, f"{job_base}_m{mi}.bin")
+            _dump_sorted_bin(move_bin, solver.tt, [])
+            total_tt_count += len(solver.tt)
+            move_bins.append(move_bin)
+            del solver  # 释放 TT dict
 
-    # 最终输出：排序去重的 .bin（覆盖 tmp）
-    _dump_sorted_bin(bin_path, all_tt, child_results)
-    # 删除 tmp
+            board.undo(u)
+
+    except Exception as e:
+        # 记录错误到 progress，让 coordinator 和 status 命令能看到
+        import traceback
+        try:
+            with open(progress_path, "w") as pf:
+                json.dump({"status": "crashed", "total_nodes": total_nodes,
+                           "error": f"{type(e).__name__}: {e}",
+                           "traceback": traceback.format_exc(),
+                           "elapsed_ms": int((time.monotonic() - t0) * 1000)}, pf)
+        except OSError:
+            pass
+        raise
+    finally:
+        f.close()
+
+    # k-way 合并所有 per-move .bin → 最终 worker .bin
+    if move_bins:
+        iters = [_iter_records(p) for p in move_bins if os.path.exists(p)]
+        count = 0
+        with open(bin_path, "wb") as out:
+            _write_header(out, status=1, count=0)
+            for rec in heapq.merge(*iters):
+                out.write(rec)
+                count += 1
+            out.seek(0)
+            _write_header(out, status=1, count=count)
+        # 清理 per-move 临时文件
+        for p in move_bins:
+            for suffix in ("", ".results.json"):
+                try:
+                    os.remove(p + suffix)
+                except OSError:
+                    pass
+    else:
+        # 无有效 move，写空 .bin
+        with open(bin_path, "wb") as out:
+            _write_header(out, status=1, count=0)
+
+    # 清理增量 tmp
     try:
         os.remove(tmp_path)
+    except OSError:
+        pass
+
+    # 写 child_results
+    results_path = bin_path + ".results.json"
+    try:
+        with open(results_path, "w") as rf:
+            json.dump(child_results, rf)
     except OSError:
         pass
 
     try:
         with open(progress_path, "w") as pf:
             json.dump({"status": "done", "total_nodes": total_nodes,
+                       "tt_size": total_tt_count,
                        "elapsed_ms": int((time.monotonic() - t0) * 1000)}, pf)
     except OSError:
         pass
@@ -567,6 +628,8 @@ def run_precompute_parallel(board_grid: List[int], last_capture: int,
             snap["elapsed_ms"] = wp.get("elapsed_ms", 0)
             snap["status"] = wp.get("status", "unknown")
             snap["current_move"] = wp.get("current_move")
+            if wp.get("error"):
+                snap["error"] = wp["error"]
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             snap["status"] = "crashed" if i in crashed_set else "unknown"
             snap["total_nodes"] = 0
@@ -771,9 +834,10 @@ def _cli_status(problem_id: str):
             "tt_size": wd.get("tt_size", wd.get("tt_flushed", 0)),
             "elapsed_ms": wd.get("elapsed_ms", 0),
             "current_move": wd.get("current_move"),
+            "error": wd.get("error"),
         }
         # 检查进程是否还活着
-        if pid is not None and wd.get("status") != "done":
+        if pid is not None and wd.get("status") not in ("done", "crashed"):
             try:
                 os.kill(pid, 0)  # 不发信号，仅检测存活
             except ProcessLookupError:
@@ -812,6 +876,9 @@ def _print_worker_table(workers: list):
         ec_str = str(ec) if ec is not None else "-"
         # 备注
         notes = []
+        err = w.get("error")
+        if err:
+            notes.append(err)
         cm = w.get("current_move")
         if cm and w.get("status") == "running":
             notes.append(f"当前={cm}")
