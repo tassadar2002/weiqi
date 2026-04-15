@@ -35,22 +35,23 @@ class UndoInfo:
 
 class Board:
     """13×13 棋盘。grid 用一维 list，索引 = y * size + x。"""
-    __slots__ = ("size", "grid", "last_capture", "zh")
+    __slots__ = ("size", "grid", "last_capture", "zh", "_visited")
 
     def __init__(self, size: int = BOARD_SIZE):
         self.size = size
         self.grid: List[int] = [EMPTY] * (size * size)
         self.last_capture: int = -1
         self.zh: int = 0  # Zobrist hash
-        # 初始空棋盘的 zh：所有位置 EMPTY(index=1) 的 XOR
+        self._visited = bytearray(size * size)  # BFS 复用缓冲区
         for i in range(size * size):
-            self.zh ^= ZOBRIST[i][1]  # EMPTY+1=1
+            self.zh ^= ZOBRIST[i][1]
 
     def clone(self) -> "Board":
         b = Board(self.size)
         b.grid = list(self.grid)
         b.last_capture = self.last_capture
         b.zh = self.zh
+        b._visited = bytearray(self.size * self.size)
         return b
 
     def get(self, x: int, y: int) -> int:
@@ -85,9 +86,10 @@ class Board:
         if color == EMPTY:
             return [], set()
 
-        visited = bytearray(size * size)
+        visited = self._visited
         group: List[Tuple[int, int]] = []
         libs: Set[int] = set()
+        touched = [i0]  # 记录所有标记过的位置，用于清零
         stack = [i0]
         visited[i0] = 1
         sz_m1 = size - 1
@@ -100,6 +102,7 @@ class Board:
                 ni = pos - size
                 if not visited[ni]:
                     visited[ni] = 1
+                    touched.append(ni)
                     s = grid[ni]
                     if s == color: stack.append(ni)
                     elif s == EMPTY: libs.add(ni)
@@ -107,6 +110,7 @@ class Board:
                 ni = pos + size
                 if not visited[ni]:
                     visited[ni] = 1
+                    touched.append(ni)
                     s = grid[ni]
                     if s == color: stack.append(ni)
                     elif s == EMPTY: libs.add(ni)
@@ -114,6 +118,7 @@ class Board:
                 ni = pos - 1
                 if not visited[ni]:
                     visited[ni] = 1
+                    touched.append(ni)
                     s = grid[ni]
                     if s == color: stack.append(ni)
                     elif s == EMPTY: libs.add(ni)
@@ -121,9 +126,14 @@ class Board:
                 ni = pos + 1
                 if not visited[ni]:
                     visited[ni] = 1
+                    touched.append(ni)
                     s = grid[ni]
                     if s == color: stack.append(ni)
                     elif s == EMPTY: libs.add(ni)
+
+        # 清零已访问位置（O(group+libs) 而非 O(169)）
+        for pos in touched:
+            visited[pos] = 0
 
         return group, libs
 
