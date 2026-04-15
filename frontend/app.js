@@ -77,6 +77,8 @@ class App {
         : p.precompute_status === 'running' ? '<span class="status-running">预处理中</span>'
         : '<span class="status-none">未预处理</span>';
       const hasTarget = (p.kill_count || 0) + (p.defend_count || 0) > 0;
+      const canPlay = hasTarget && p.precompute_status === 'done';
+      const playTip = !hasTarget ? '请先设定目标' : (p.precompute_status !== 'done' ? '请先完成预处理' : '');
       return `<div class="problem-card" data-id="${p.id}">
         <div class="problem-card-body">
           <div class="problem-name">${this.esc(p.name)}</div>
@@ -84,7 +86,7 @@ class App {
         </div>
         <div class="problem-actions">
           <button class="card-btn card-btn-edit" data-id="${p.id}">编辑</button>
-          <button class="card-btn card-btn-play${hasTarget ? '' : ' disabled'}" data-id="${p.id}" ${hasTarget ? '' : 'disabled'}>练习</button>
+          <button class="card-btn card-btn-play${canPlay ? '' : ' disabled'}" data-id="${p.id}" ${canPlay ? '' : 'disabled'} ${playTip ? `title="${playTip}"` : ''}>练习</button>
         </div>
       </div>`;
     }).join('');
@@ -271,6 +273,11 @@ class App {
     if (!p) return;
     if (!this.targetInfo) {
       this.showFeedback('incorrect', '请先编辑此题并设定目标');
+      this.showListView();
+      return;
+    }
+    if (p.precompute_status !== 'done') {
+      this.showFeedback('incorrect', '请先完成预处理后再练习');
       this.showListView();
       return;
     }
