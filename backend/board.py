@@ -12,6 +12,12 @@ WHITE = -1
 EMPTY = 0
 BOARD_SIZE = 13
 
+# Zobrist 哈希表：ZOBRIST[pos][color+1]，color: -1→0, 0→1, 1→2
+import random as _random
+_rng = _random.Random(0x57454951495F5A48)  # 固定种子，保证可重现
+ZOBRIST = [[_rng.getrandbits(64) for _ in range(3)]
+           for _ in range(BOARD_SIZE * BOARD_SIZE)]
+
 
 class UndoInfo:
     """落子的撤销句柄。"""
@@ -29,24 +35,32 @@ class UndoInfo:
 
 class Board:
     """13×13 棋盘。grid 用一维 list，索引 = y * size + x。"""
-    __slots__ = ("size", "grid", "last_capture")
+    __slots__ = ("size", "grid", "last_capture", "zh")
 
     def __init__(self, size: int = BOARD_SIZE):
         self.size = size
         self.grid: List[int] = [EMPTY] * (size * size)
         self.last_capture: int = -1
+        self.zh: int = 0  # Zobrist hash
+        # 初始空棋盘的 zh：所有位置 EMPTY(index=1) 的 XOR
+        for i in range(size * size):
+            self.zh ^= ZOBRIST[i][1]  # EMPTY+1=1
 
     def clone(self) -> "Board":
         b = Board(self.size)
         b.grid = list(self.grid)
         b.last_capture = self.last_capture
+        b.zh = self.zh
         return b
 
     def get(self, x: int, y: int) -> int:
         return self.grid[y * self.size + x]
 
     def set(self, x: int, y: int, v: int) -> None:
-        self.grid[y * self.size + x] = v
+        i = y * self.size + x
+        old = self.grid[i]
+        self.zh ^= ZOBRIST[i][old + 1] ^ ZOBRIST[i][v + 1]
+        self.grid[i] = v
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.size and 0 <= y < self.size
@@ -125,6 +139,8 @@ class Board:
             return None
 
         prev_lc = self.last_capture
+        prev_zh = self.zh
+        self.zh ^= ZOBRIST[i][1] ^ ZOBRIST[i][color + 1]  # EMPTY → color
         grid[i] = color
         opp = -color
         captured: List[Tuple[int, int, int]] = []
@@ -135,25 +151,33 @@ class Board:
             group, libs = self.group_and_libs(x, y - 1)
             if len(libs) == 0:
                 for gx, gy in group:
-                    grid[gy * size + gx] = EMPTY
+                    gi = gy * size + gx
+                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                    grid[gi] = EMPTY
                     captured.append((gx, gy, opp))
         if y < sz_m1 and grid[i + size] == opp:
             group, libs = self.group_and_libs(x, y + 1)
             if len(libs) == 0:
                 for gx, gy in group:
-                    grid[gy * size + gx] = EMPTY
+                    gi = gy * size + gx
+                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                    grid[gi] = EMPTY
                     captured.append((gx, gy, opp))
         if x > 0 and grid[i - 1] == opp:
             group, libs = self.group_and_libs(x - 1, y)
             if len(libs) == 0:
                 for gx, gy in group:
-                    grid[gy * size + gx] = EMPTY
+                    gi = gy * size + gx
+                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                    grid[gi] = EMPTY
                     captured.append((gx, gy, opp))
         if x < sz_m1 and grid[i + 1] == opp:
             group, libs = self.group_and_libs(x + 1, y)
             if len(libs) == 0:
                 for gx, gy in group:
-                    grid[gy * size + gx] = EMPTY
+                    gi = gy * size + gx
+                    self.zh ^= ZOBRIST[gi][opp + 1] ^ ZOBRIST[gi][1]
+                    grid[gi] = EMPTY
                     captured.append((gx, gy, opp))
 
         # 自杀检测
@@ -162,6 +186,7 @@ class Board:
             for gx, gy, c in reversed(captured):
                 grid[gy * size + gx] = c
             grid[i] = EMPTY
+            self.zh = prev_zh
             return None
 
         # 简单 ko
@@ -176,6 +201,7 @@ class Board:
                 for gx, gy, c in reversed(captured):
                     grid[gy * size + gx] = c
                 grid[i] = EMPTY
+                self.zh = prev_zh
                 return None
             cx, cy, _ = captured[0]
             self.last_capture = cy * size + cx
@@ -187,9 +213,15 @@ class Board:
     def undo(self, u: UndoInfo) -> None:
         size = self.size
         grid = self.grid
-        grid[u.y * size + u.x] = EMPTY
+        i = u.y * size + u.x
+        # 还原 zh：落子 color → EMPTY
+        self.zh ^= ZOBRIST[i][u.color + 1] ^ ZOBRIST[i][1]
+        grid[i] = EMPTY
         for gx, gy, c in reversed(u.captured):
-            grid[gy * size + gx] = c
+            gi = gy * size + gx
+            # 还原 zh：EMPTY → captured color
+            self.zh ^= ZOBRIST[gi][1] ^ ZOBRIST[gi][c + 1]
+            grid[gi] = c
         self.last_capture = u.prev_last_capture
 
     def play(self, x: int, y: int, color: int) -> Optional[int]:
@@ -215,4 +247,5 @@ class Board:
     # ---- 哈希 ----
 
     def hash(self) -> str:
+        """Legacy string hash (for compatibility). Prefer zh for speed."""
         return "".join(chr(48 + g + 1) for g in self.grid)

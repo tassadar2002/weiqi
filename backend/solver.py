@@ -47,7 +47,7 @@ class DfpnSolver:
         self.max_depth = max_depth
         self.progress_callback = progress_callback
 
-        self.tt: Dict[str, Tuple[int, int]] = {}
+        self.tt: Dict[tuple, Tuple[int, int]] = {}
         self.nodes = 0
         self.start_time = 0.0
         self._initial_turn = 0  # 记录 solve() 传入的 turn，供 progress 查根
@@ -55,8 +55,8 @@ class DfpnSolver:
 
     # ---- TT ----
 
-    def _tt_key(self, turn: int) -> str:
-        return f"{self.board.hash()}|{turn}|{self.board.last_capture}"
+    def _tt_key(self, turn: int) -> tuple:
+        return (self.board.zh, turn, self.board.last_capture)
 
     def _tt_get(self, turn: int) -> Tuple[int, int]:
         return self.tt.get(self._tt_key(turn), (1, 1))

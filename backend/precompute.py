@@ -40,21 +40,32 @@ def _get_meta(db: sqlite3.Connection, key: str) -> Optional[str]:
     return row[0] if row else None
 
 
-def _flush_tt(db: sqlite3.Connection, tt_dict: Dict[str, Tuple[int, int]],
-              already_flushed: int) -> None:
+def _flush_tt(db: sqlite3.Connection, tt_dict: Dict, already_flushed: int) -> None:
     """增量写入：只写 dict 中 index >= already_flushed 的新条目。"""
     items = list(tt_dict.items())[already_flushed:]
     if items:
         db.executemany("INSERT OR REPLACE INTO tt (key, pn, dn) VALUES (?, ?, ?)",
-                       [(k, v[0], v[1]) for k, v in items])
+                       [(_tt_key_to_str(k), v[0], v[1]) for k, v in items])
 
 
-def load_tt_from_sqlite(db_path: str) -> Dict[str, Tuple[int, int]]:
-    """从 SQLite 加载全部 TT 到内存 dict。"""
+def _tt_key_to_str(key) -> str:
+    """TT key (tuple or str) → SQLite 存储字符串。"""
+    if isinstance(key, tuple):
+        return f"{key[0]}|{key[1]}|{key[2]}"
+    return key
+
+
+def load_tt_from_sqlite(db_path: str) -> Dict:
+    """从 SQLite 加载全部 TT 到内存 dict。key 为 "zh|turn|lc" 字符串。"""
     db = sqlite3.connect(db_path)
     rows = db.execute("SELECT key, pn, dn FROM tt").fetchall()
     db.close()
-    return {r[0]: (r[1], r[2]) for r in rows}
+    # 转为 tuple key 以匹配 solver 的 _tt_key 格式
+    tt = {}
+    for key_str, pn, dn in rows:
+        parts = key_str.split("|")
+        tt[(int(parts[0]), int(parts[1]), int(parts[2]))] = (pn, dn)
+    return tt
 
 
 # ============================================================
@@ -70,8 +81,8 @@ def solve_from_cache(tt: Dict[str, Tuple[int, int]],
     """
     size = board.size
 
-    def tt_key(t: int) -> str:
-        return f"{board.hash()}|{t}|{board.last_capture}"
+    def tt_key(t: int) -> tuple:
+        return (board.zh, t, board.last_capture)
 
     root_pn, root_dn = tt.get(tt_key(turn), (1, 1))
     if root_pn == 0:
