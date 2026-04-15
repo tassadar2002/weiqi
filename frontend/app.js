@@ -1,137 +1,158 @@
 // ============================================================
-// 应用控制器（前后端分离版）
-//
-// 所有 Go 规则与 df-pn 求解都在 Python 后端 (/api/*)。前端只负责：
-//   - 渲染棋盘
-//   - 收集用户事件
-//   - 维护展示用的本地状态（落子记录、决策日志）
-//
-// 与后端的所有交互都是异步的，通过 api.js 中的 API.* 方法。
+// 围棋习题集 · 前端控制器
+// 两视图 SPA：列表视图 (#list-view) ↔ 详情视图 (#detail-view)
 // ============================================================
-
-const SOLVE_OPTIONS = {
-  maxTimeMs: 300000,   // 5 分钟（大区域 + 多目标需要更多时间）
-  maxNodes: 50000000,  // 5000 万节点
-  maxDepth: 60,
-};
 
 class App {
   constructor() {
     this.board = new ClientBoard(BOARD_SIZE);
-    this.regionMask = createDefaultMask(BOARD_SIZE);
-    this.canvas = document.getElementById('board-canvas');
-    this.renderer = new BoardRenderer(this.canvas, BOARD_SIZE);
-
-    this.mode = 'layout';   // 'layout' | 'region' | 'solve' | 'pick-target'
+    this.regionMask = createEmptyMask(BOARD_SIZE);
+    this.renderer = null;
+    this.mode = 'layout';
     this.placementColor = 'black';
-    this.initialSnapshot = null;
+    this.problemId = null;
+    this.problemData = null;
     this.targetInfo = null;
+    this.killTargets = [];
+    this.defendTargets = [];
     this.waitingForAI = false;
     this.autoplayTimer = null;
     this.autoplayColor = B;
     this.moveHistory = [];
     this.moveCounter = 0;
     this.decisionLog = [];
-    // 多目标
-    this.killTargets = [];    // [{coord, color, group, libs, stones, eyes}, ...]
-    this.defendTargets = [];  // 同上
-
-    this.loadInitialSetup();
-    this.bindEvents();
-    this.syncRendererMask();
-    this.renderBoard();
+    this.precomputeJobId = null;
+    this.precomputeTimer = null;
+    this.bindGlobalEvents();
+    this.showListView();
   }
 
-  loadInitialSetup() {
-    const blacks = [
-      [0,8],
-      [1,5],[1,6],[1,7],
-      [2,6],
-      [3,6],
-      [4,7],
-      [5,7],
-      [6,5],[6,7],
-      [8,6],[8,8],
-    ];
-    const whites = [
-      [1,2],[1,4],
-      [1,8],[1,9],
-      [2,5],[2,7],
-      [3,5],[3,7],
-      [4,5],[4,6],
-    ];
-    for (const [x, y] of blacks) this.board.set(x, y, B);
-    for (const [x, y] of whites) this.board.set(x, y, W);
-  }
-
-  syncRendererMask() {
-    this.renderer.regionMask = this.regionMask;
-    this.renderer.showMask = (this.mode !== 'layout');
-  }
-
-  bindEvents() {
-    this.canvas.addEventListener('click', (e) => this.onCanvasClick(e));
-    this.canvas.addEventListener('mousemove', (e) => this.onCanvasMouseMove(e));
-    this.canvas.addEventListener('mouseleave', () => {
-      this.renderer.ghostStone = null;
-      this.renderBoard();
-    });
-
-    document.getElementById('sel-black').addEventListener('click', () => this.setPlacementColor('black'));
-    document.getElementById('sel-white').addEventListener('click', () => this.setPlacementColor('white'));
-    document.getElementById('sel-erase').addEventListener('click', () => this.setPlacementColor('erase'));
-
+  bindGlobalEvents() {
+    document.getElementById('btn-new-problem').addEventListener('click', () => this.createProblem());
+    document.getElementById('btn-back-list').addEventListener('click', () => this.showListView());
+    document.getElementById('btn-save').addEventListener('click', () => this.saveProblem());
+    document.getElementById('btn-delete').addEventListener('click', () => this.deleteProblem());
+    document.getElementById('sel-black').addEventListener('click', () => this.setPlacement('black'));
+    document.getElementById('sel-white').addEventListener('click', () => this.setPlacement('white'));
+    document.getElementById('sel-erase').addEventListener('click', () => this.setPlacement('erase'));
     document.getElementById('btn-to-region').addEventListener('click', () => this.enterRegionMode());
-    document.getElementById('btn-default-region').addEventListener('click', () => {
-      this.regionMask = createDefaultMask(BOARD_SIZE);
-      this.syncRendererMask();
-      this.renderBoard();
-    });
-    document.getElementById('btn-clear-region').addEventListener('click', () => {
-      this.regionMask = createEmptyMask(BOARD_SIZE);
-      this.syncRendererMask();
-      this.renderBoard();
-    });
-    document.getElementById('btn-all-region').addEventListener('click', () => {
-      this.regionMask = createFullMask(BOARD_SIZE);
-      this.syncRendererMask();
-      this.renderBoard();
-    });
+    document.getElementById('btn-clear-region').addEventListener('click', () => { this.regionMask = createEmptyMask(); this.syncMask(); this.render(); });
+    document.getElementById('btn-all-region').addEventListener('click', () => { this.regionMask = createFullMask(); this.syncMask(); this.render(); });
+    document.getElementById('btn-back-layout').addEventListener('click', () => this.enterLayoutMode());
     document.getElementById('btn-to-solve').addEventListener('click', () => this.enterSolveMode());
-    document.getElementById('btn-back-layout-from-region').addEventListener('click', () => this.enterLayoutMode());
-    document.getElementById('btn-reset').addEventListener('click', () => this.enterLayoutMode());
+    document.getElementById('btn-pick-target').addEventListener('click', () => this.enterPickTarget());
+    document.getElementById('btn-confirm-target').addEventListener('click', () => this.confirmTarget());
     document.getElementById('btn-autoplay').addEventListener('click', () => this.toggleAutoplay());
-    document.getElementById('btn-pick-target').addEventListener('click', () => this.enterPickTargetMode());
-    document.getElementById('btn-confirm-target').addEventListener('click', () => this.confirmMultiTarget());
+    document.getElementById('btn-reset').addEventListener('click', () => this.enterLayoutMode());
+    document.getElementById('btn-precompute').addEventListener('click', () => this.startPrecompute());
+    document.getElementById('btn-stop-precompute').addEventListener('click', () => this.stopPrecompute());
+  }
 
-    window.addEventListener('resize', () => {
-      this.renderer.resize();
-      this.renderBoard();
+  // ============================================================
+  // 列表视图
+  // ============================================================
+
+  async showListView() {
+    this.stopAutoplay();
+    this.stopPrecomputePoll();
+    document.getElementById('list-view').classList.remove('hidden');
+    document.getElementById('detail-view').classList.add('hidden');
+    const r = await API.listProblems();
+    const list = document.getElementById('problem-list');
+    if (!r.problems || r.problems.length === 0) {
+      list.innerHTML = '<div class="empty-hint">还没有习题，点击"+ 新建习题"开始</div>';
+      return;
+    }
+    list.innerHTML = r.problems.map(p => {
+      const st = p.precompute_status === 'done' ? '<span class="status-done">已预处理</span>'
+        : p.precompute_status === 'running' ? '<span class="status-running">预处理中</span>'
+        : '<span class="status-none">未预处理</span>';
+      return `<div class="problem-card" data-id="${p.id}">
+        <div class="problem-name">${this.esc(p.name)}</div>
+        <div class="problem-meta">${p.black_count}黑/${p.white_count}白 · 区域${p.region_count}格 · ${st}</div>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.problem-card').forEach(el => {
+      el.addEventListener('click', () => this.openProblem(el.dataset.id));
     });
   }
 
-  renderBoard() {
-    this.renderer.render(this.board);
+  async createProblem() {
+    const r = await API.createProblem('未命名习题');
+    await this.openProblem(r.id);
   }
 
-  setPlacementColor(color) {
-    this.placementColor = color;
-    document.querySelectorAll('#color-selector .tool-btn').forEach(btn => btn.classList.remove('active-tool'));
-    const idMap = { black: 'sel-black', white: 'sel-white', erase: 'sel-erase' };
-    document.getElementById(idMap[color]).classList.add('active-tool');
+  async openProblem(id) {
+    const p = await API.getProblem(id);
+    if (!p) { alert('习题不存在'); return; }
+    this.problemId = id;
+    this.problemData = p;
+    this.board.replaceFromArray(p.board_grid, -1);
+    this.regionMask = new Uint8Array(p.region_mask);
 
-    const dot = document.getElementById('move-dot');
-    const text = document.getElementById('move-text');
-    dot.className = '';
-    if (color === 'black') {
-      text.textContent = '放置黑子';
-    } else if (color === 'white') {
-      dot.className = 'white';
-      text.textContent = '放置白子';
-    } else {
-      dot.className = 'layout';
-      text.textContent = '擦除模式';
+    // 从 DB 恢复目标：向后端获取完整群信息（group/libs/stones/eyes）
+    this.killTargets = [];
+    for (const c of (p.kill_targets || [])) {
+      const info = await API.validateTarget(this.board.toArray(), Array.from(this.regionMask), c[0], c[1]);
+      if (!info.error) this.killTargets.push(info);
     }
+    this.defendTargets = [];
+    for (const c of (p.defend_targets || [])) {
+      const info = await API.validateTarget(this.board.toArray(), Array.from(this.regionMask), c[0], c[1]);
+      if (!info.error) this.defendTargets.push(info);
+    }
+    // 若有目标，自动设置 targetInfo（不需用户再次确认）
+    if (this.killTargets.length > 0 || this.defendTargets.length > 0) {
+      this.targetInfo = {
+        attacker_color: B,
+        kill_targets_coords: this.killTargets.map(t => t.coord),
+        defend_targets_coords: this.defendTargets.map(t => t.coord),
+      };
+    } else {
+      this.targetInfo = null;
+    }
+
+    document.getElementById('problem-title').value = p.name;
+    document.getElementById('list-view').classList.add('hidden');
+    document.getElementById('detail-view').classList.remove('hidden');
+    // 初始化 renderer
+    const canvas = document.getElementById('board-canvas');
+    if (!this.renderer) {
+      this.renderer = new BoardRenderer(canvas, BOARD_SIZE);
+      canvas.addEventListener('click', e => this.onCanvasClick(e));
+      canvas.addEventListener('mousemove', e => this.onCanvasMouseMove(e));
+      canvas.addEventListener('mouseleave', () => { this.renderer.ghostStone = null; this.render(); });
+      window.addEventListener('resize', () => { this.renderer.resize(); this.render(); });
+    } else {
+      this.renderer.resize();
+    }
+    this.moveHistory = [];
+    this.moveCounter = 0;
+    this.decisionLog = [];
+    this.targetInfo = null;
+    this.precomputeJobId = p.precompute_job_id || null;
+    this.enterLayoutMode();
+  }
+
+  async saveProblem() {
+    if (!this.problemId) return;
+    const name = document.getElementById('problem-title').value || '未命名习题';
+    await API.updateProblem(this.problemId, {
+      name,
+      board_grid: this.board.toArray(),
+      region_mask: Array.from(this.regionMask),
+      kill_targets: this.killTargets.map(t => t.coord),
+      defend_targets: this.defendTargets.map(t => t.coord),
+      attacker_color: B,
+    });
+    this.showFeedback('correct', '已保存');
+  }
+
+  async deleteProblem() {
+    if (!this.problemId) return;
+    if (!confirm('确定删除此习题？')) return;
+    await API.deleteProblem(this.problemId);
+    this.showListView();
   }
 
   // ============================================================
@@ -143,671 +164,315 @@ class App {
     this.mode = 'layout';
     this.renderer.lastMove = null;
     this.renderer.ghostStone = null;
+    this.renderer.moveHistory = [];
     this.moveHistory = [];
     this.moveCounter = 0;
-    this.renderer.moveHistory = this.moveHistory;
     this.decisionLog = [];
-    this.renderDecisionLog();
-    this.waitingForAI = false;
-
-    if (this.initialSnapshot) {
-      this.board.replaceFromArray(this.initialSnapshot.boardArr, -1);
-      this.regionMask = cloneMask(this.initialSnapshot.regionMask);
-      this.initialSnapshot = null;
-    }
-    this.targetInfo = null;
-    this.killTargets = [];
-    this.defendTargets = [];
-    this.renderer.targetCoord = null;
-    this.renderer.targetGroupCoords = null;
-    this.renderer.targetColor = null;
-    this.renderer.killGroups = [];
-    this.renderer.defendGroups = [];
-
-    document.getElementById('layout-controls').classList.remove('hidden');
-    document.getElementById('region-controls').classList.add('hidden');
-    document.getElementById('play-controls').classList.add('hidden');
-    document.getElementById('decision-log').classList.add('hidden');
+    this.renderLog();
+    this.syncMask();
+    this.renderer.showMask = false;
+    this.syncTargetHighlight();
+    this._showCard('layout-controls');
+    document.getElementById('move-dot').className = 'layout';
+    document.getElementById('move-text').textContent = '布局模式';
     this.hideFeedback();
-    this.setPlacementColor(this.placementColor);
-    this.syncRendererMask();
-    this.renderBoard();
+    this.render();
   }
 
   enterRegionMode() {
-    if (this.board.count(B) === 0 || this.board.count(W) === 0) {
-      this.showFeedback('incorrect', '请先在棋盘上摆放黑子和白子。');
-      return;
+    if (this.board.count(B) === 0 && this.board.count(W) === 0) {
+      this.showFeedback('incorrect', '请先摆放棋子'); return;
     }
     this.mode = 'region';
-
-    document.getElementById('layout-controls').classList.add('hidden');
-    document.getElementById('region-controls').classList.remove('hidden');
-    document.getElementById('play-controls').classList.add('hidden');
-    this.hideFeedback();
-
+    this.renderer.showMask = true;
+    this.syncMask();
+    this._showCard('region-controls');
     document.getElementById('move-dot').className = 'layout';
     document.getElementById('move-text').textContent = '点击设置落子点';
-
-    this.syncRendererMask();
-    this.renderBoard();
+    this.hideFeedback();
+    this.render();
   }
 
   enterSolveMode() {
     if (maskCellCount(this.regionMask) === 0) {
-      this.showFeedback('incorrect', '落子点区域不能为空。');
-      return;
+      this.showFeedback('incorrect', '落子区域不能为空'); return;
     }
-
-    this.initialSnapshot = {
-      boardArr: this.board.toArray(),
-      regionMask: cloneMask(this.regionMask),
-    };
     this.mode = 'solve';
+    this.renderer.showMask = true;
     this.renderer.lastMove = null;
-    this.renderer.ghostStone = null;
     this.autoplayColor = B;
     this.moveHistory = [];
     this.moveCounter = 0;
-    this.renderer.moveHistory = this.moveHistory;
+    this.renderer.moveHistory = [];
     this.decisionLog = [];
-    document.getElementById('btn-autoplay').textContent = '最优解';
-
-    this.targetInfo = null;
-    this.renderer.targetCoord = null;
-    this.renderer.targetGroupCoords = null;
-    this.renderer.targetColor = null;
-    this.updateTargetLabel();
-
-    document.getElementById('layout-controls').classList.add('hidden');
-    document.getElementById('region-controls').classList.add('hidden');
-    document.getElementById('play-controls').classList.remove('hidden');
+    this._showCard('play-controls');
     document.getElementById('decision-log').classList.remove('hidden');
-    this.hideFeedback();
-
+    this.updateTargetLabel();
+    this.updatePrecomputeButtons();
     document.getElementById('move-dot').className = '';
-    this.syncRendererMask();
-    this.renderBoard();
-
-    // 强制进入"点选目标"子模式
-    this.enterPickTargetMode();
-  }
-
-  // ============================================================
-  // 决策日志
-  // ============================================================
-
-  logEntry(entry) {
-    this.decisionLog.push(entry);
-    this.renderDecisionLog();
-  }
-
-  logTargetDecision() {
-    if (this.killTargets.length === 0 && this.defendTargets.length === 0) return;
-
-    const killDesc = this.killTargets.map(t =>
-      `<span class="cand" style="border-color:#c73e3a;">杀 (${t.coord[0]},${t.coord[1]}) ${t.stones}子/${t.libs}气</span>`
-    ).join('');
-    const defDesc = this.defendTargets.map(t =>
-      `<span class="cand" style="border-color:#3a6ec7;">守 (${t.coord[0]},${t.coord[1]}) ${t.stones}子/${t.libs}气</span>`
-    ).join('');
-
-    this.logEntry({
-      type: 'target',
-      main: `设定复合目标`,
-      meta: `杀目标 ${this.killTargets.length} 个 · 守目标 ${this.defendTargets.length} 个`,
-      sub: (killDesc || '') + (defDesc || ''),
-    });
-  }
-
-  logMoveDecision(color, r) {
-    const step = this.moveCounter;
-    const side = color === B ? '黑' : '白';
-    const role = color === this.targetInfo.attacker_color ? '攻' : '防';
-    let tag, tagClass;
-    if (r.move && r.move.certain) {
-      tag = '必胜';
-      tagClass = 'tag-win';
-    } else if (r.result === 'UNPROVEN') {
-      tag = '试探';
-      tagClass = 'tag-probe';
-    } else {
-      tag = '顽抗';
-      tagClass = 'tag-resist';
+    this.hideFeedback();
+    this.render();
+    // 如果没有目标则自动进入选择
+    if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
+      this.enterPickTarget();
     }
-    const posStr = r.move.pass ? 'PASS' : `(${r.move.x},${r.move.y})`;
-    const resultStr = r.result === 'ATTACKER_WINS' ? '攻方必胜'
-      : r.result === 'DEFENDER_WINS' ? '防方必胜'
-      : '未证明';
-    const pnStr = r.pn >= 1e9 ? '∞' : r.pn;
-    const dnStr = r.dn >= 1e9 ? '∞' : r.dn;
-
-    this.logEntry({
-      type: 'move',
-      color,
-      main: `${side}${role} ${posStr}`,
-      step,
-      tag, tagClass,
-      meta: `${resultStr} · pn=${pnStr} dn=${dnStr} · ${r.nodes.toLocaleString()} 节点 · ${(r.elapsed_ms / 1000).toFixed(2)}s`,
-      sub: r.move.certain ? '按证明树推进' : '走顽强抵抗着',
-    });
   }
 
-  logTerminal(kind) {
-    const text = kind === 'TARGET_CAPTURED' ? '目标被提子 → 攻方胜'
-      : kind === 'TARGET_ALIVE' ? '目标已做出双眼 → 防方胜'
-      : kind === 'ATK_NO_MOVE' ? '攻方无合法着法 → 防方胜'
-      : kind === 'DEF_NO_MOVE' ? '防方无合法着法 → 攻方胜'
-      : '对局结束';
-    this.logEntry({ type: 'terminal', main: text });
-  }
-
-  renderDecisionLog() {
-    const list = document.getElementById('log-list');
-    if (!list) return;
-    list.innerHTML = this.decisionLog.map(e => {
-      if (e.type === 'target') {
-        return `<div class="log-entry entry-target">
-          <div class="log-main">${this.escape(e.main)}</div>
-          <div class="log-meta">${this.escape(e.meta)}</div>
-          <div class="log-sub">${e.sub || ''}</div>
-        </div>`;
-      }
-      if (e.type === 'move') {
-        const cls = e.color === B ? 'entry-move-black' : 'entry-move-white';
-        const step = e.step != null ? `<span class="log-step">#${e.step}</span>` : '';
-        const tag = e.tag ? `<span class="log-tag ${e.tagClass}">${e.tag}</span>` : '';
-        return `<div class="log-entry ${cls}">
-          <div class="log-main">${step}${this.escape(e.main)}${tag}</div>
-          <div class="log-meta">${this.escape(e.meta)}</div>
-          ${e.sub ? `<div class="log-sub">${this.escape(e.sub)}</div>` : ''}
-        </div>`;
-      }
-      if (e.type === 'terminal') {
-        return `<div class="log-entry entry-terminal">
-          <div class="log-main">${this.escape(e.main)}</div>
-        </div>`;
-      }
-      return '';
-    }).join('');
-    list.scrollTop = list.scrollHeight;
-  }
-
-  escape(s) {
-    if (s == null) return '';
-    return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  _showCard(id) {
+    ['layout-controls', 'region-controls', 'play-controls'].forEach(
+      c => document.getElementById(c).classList.toggle('hidden', c !== id));
+    document.getElementById('decision-log').classList.toggle('hidden', id !== 'play-controls');
   }
 
   // ============================================================
-  // 落子历史与目标标签
+  // 目标选择
   // ============================================================
 
-  recordMove(x, y, color) {
-    // 清理已被提子的旧记录 + 同位置覆盖
-    for (let i = this.moveHistory.length - 1; i >= 0; i--) {
-      const m = this.moveHistory[i];
-      const stale = (this.board.get(m.x, m.y) !== m.color) || (m.x === x && m.y === y);
-      if (stale) this.moveHistory.splice(i, 1);
-    }
-    this.moveCounter++;
-    this.moveHistory.push({ x, y, color, number: this.moveCounter });
-    this.renderer.moveHistory = this.moveHistory;
+  enterPickTarget() {
+    this.mode = 'pick-target';
+    this.canvas_cursor('crosshair');
+    document.getElementById('btn-confirm-target').classList.remove('hidden');
+    document.getElementById('move-text').textContent = '点白子=杀(红)，点黑子=守(蓝)，再点取消';
+    this.showFeedback('correct', '点击棋子设定目标，点空点结束');
+    this.syncTargetHighlight();
+    this.render();
   }
 
-  countRegionEmpty() {
-    let n = 0;
-    for (let i = 0; i < this.regionMask.length; i++) {
-      if (!this.regionMask[i]) continue;
-      if (this.board.grid[i] === E) n++;
+  exitPickTarget() {
+    this.mode = 'solve';
+    this.canvas_cursor('');
+    document.getElementById('btn-confirm-target').classList.add('hidden');
+    this.hideFeedback();
+    this.updateTargetLabel();
+    this.updatePrecomputeButtons();
+    document.getElementById('move-text').textContent =
+      (this.killTargets.length + this.defendTargets.length > 0) ? '轮到黑棋' : '未选目标';
+  }
+
+  async onPickTargetClick(bx, by) {
+    if (this.board.get(bx, by) === E) { this.exitPickTarget(); return; }
+    // 已选 → 取消
+    const ki = this._findInList(this.killTargets, bx, by);
+    if (ki >= 0) { this.killTargets.splice(ki, 1); this.syncTargetHighlight(); this.updateTargetLabel(); this.render(); return; }
+    const di = this._findInList(this.defendTargets, bx, by);
+    if (di >= 0) { this.defendTargets.splice(di, 1); this.syncTargetHighlight(); this.updateTargetLabel(); this.render(); return; }
+    // 新增
+    let info;
+    try { info = await API.validateTarget(this.board.toArray(), Array.from(this.regionMask), bx, by); } catch(e) { this.showFeedback('incorrect', '通信失败'); return; }
+    if (info.error) { this.showFeedback('incorrect', info.error); return; }
+    if (info.color === W) this.killTargets.push(info);
+    else this.defendTargets.push(info);
+    this.syncTargetHighlight();
+    this.updateTargetLabel();
+    this.render();
+    this.showFeedback('correct', `已添加 ${info.color===W?'杀(红)':'守(蓝)'}：(${bx},${by})`);
+  }
+
+  confirmTarget() {
+    if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
+      this.showFeedback('incorrect', '至少选一个目标'); return;
     }
-    return n;
+    this.targetInfo = {
+      attacker_color: B,
+      kill_targets_coords: this.killTargets.map(t => t.coord),
+      defend_targets_coords: this.defendTargets.map(t => t.coord),
+    };
+    this.logTarget();
+    this.exitPickTarget();
+  }
+
+  _findInList(list, x, y) {
+    for (let i = 0; i < list.length; i++)
+      for (const [gx, gy] of (list[i].group || []))
+        if (gx === x && gy === y) return i;
+    return -1;
+  }
+
+  syncTargetHighlight() {
+    this.renderer.killGroups = this.killTargets.map(t => ({coords: t.group, coord: t.coord}));
+    this.renderer.defendGroups = this.defendTargets.map(t => ({coords: t.group, coord: t.coord}));
   }
 
   updateTargetLabel() {
-    const el = document.getElementById('classify-label');
+    const el = document.getElementById('target-label');
+    const nk = this.killTargets.length, nd = this.defendTargets.length;
     const regionTotal = maskCellCount(this.regionMask);
-    const empty = this.countRegionEmpty();
-    let difficultyHint = '';
-    if (empty > 15) {
-      difficultyHint = `<span style="color:var(--vermillion);font-weight:700;">（空位过多，大概率 UNPROVEN。建议缩小区域至 ≤12 空位）</span>`;
-    } else if (empty > 10) {
-      difficultyHint = `<span style="color:var(--gold);">（空位较多，可能需要较长时间）</span>`;
-    }
-    const statsLine = `<div style="margin-top:0.25rem;font-weight:400;color:var(--ink-medium);font-size:0.78rem;">` +
-      `区域 ${regionTotal} 格 · 空位 ${empty} ${difficultyHint}</div>`;
-
-    const nk = this.killTargets.length;
-    const nd = this.defendTargets.length;
-    if (nk === 0 && nd === 0) {
-      el.innerHTML = `<div style="color:var(--vermillion);">未选目标（请点选棋子）</div>` + statsLine;
-      return;
-    }
+    let empty = 0;
+    for (let i = 0; i < this.regionMask.length; i++) if (this.regionMask[i] && this.board.grid[i] === E) empty++;
+    const stats = `区域${regionTotal}格·空位${empty}`;
+    if (nk === 0 && nd === 0) { el.innerHTML = `<span style="color:var(--vermillion)">未选目标</span> · ${stats}`; return; }
     const parts = [];
-    if (nk > 0) {
-      const coords = this.killTargets.map(t => `(${t.coord[0]},${t.coord[1]})`).join(' ');
-      parts.push(`<span style="color:#c73e3a;">杀${nk}群 ${coords}</span>`);
-    }
-    if (nd > 0) {
-      const coords = this.defendTargets.map(t => `(${t.coord[0]},${t.coord[1]})`).join(' ');
-      parts.push(`<span style="color:#3a6ec7;">守${nd}群 ${coords}</span>`);
-    }
-    el.innerHTML = `<div>${parts.join(' · ')}</div>` + statsLine;
+    if (nk > 0) parts.push(`<span style="color:#c73e3a">杀${nk}群</span>`);
+    if (nd > 0) parts.push(`<span style="color:#3a6ec7">守${nd}群</span>`);
+    el.innerHTML = `${parts.join('·')} · ${stats}`;
   }
 
-  displaySolveMeta(r) {
-    let label = '';
-    if (r.result === 'ATTACKER_WINS') label = '攻方必胜';
-    else if (r.result === 'DEFENDER_WINS') label = '防方必胜';
-    else label = '未证明';
-    const meta = `${label} · ${r.nodes.toLocaleString()} 节点 · ${(r.elapsed_ms / 1000).toFixed(1)}s`;
-    this.updateTargetLabel();
-    const el = document.getElementById('classify-label');
-    el.innerHTML += `<div style="margin-top:0.25rem;font-weight:400;color:var(--jade-dark);font-size:0.78rem;">上一手：${meta}</div>`;
+  updatePrecomputeButtons() {
+    const hasTarget = this.killTargets.length + this.defendTargets.length > 0;
+    const hasCache = this.problemData && this.problemData.precompute_status === 'done';
+    document.getElementById('btn-precompute').classList.toggle('hidden', !hasTarget || hasCache);
+    document.getElementById('btn-autoplay').classList.toggle('hidden', !hasTarget);
   }
 
   // ============================================================
-  // 点击事件分发
+  // 预处理
   // ============================================================
 
-  onCanvasClick(e) {
-    const rect = this.canvas.getBoundingClientRect();
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
-    const coord = this.renderer.pixelToBoard(px, py);
-    if (!coord) return;
-    const [bx, by] = coord;
-
-    if (this.mode === 'layout') {
-      this.onLayoutClick(bx, by);
-    } else if (this.mode === 'region') {
-      this.onRegionClick(bx, by);
-    } else if (this.mode === 'pick-target') {
-      this.onPickTargetClick(bx, by);
-    } else {
-      this.onSolveClick(bx, by);
-    }
+  async startPrecompute() {
+    if (!this.targetInfo) { this.showFeedback('incorrect', '请先确认目标'); return; }
+    await this.saveProblem();
+    const r = await API.precomputeStart(
+      this.board.toArray(), this.board.lastCapture,
+      Array.from(this.regionMask),
+      this.killTargets.map(t => t.coord),
+      this.defendTargets.map(t => t.coord),
+      B, B, this.problemId,
+    );
+    this.precomputeJobId = r.job_id;
+    document.getElementById('btn-precompute').classList.add('hidden');
+    document.getElementById('btn-stop-precompute').classList.remove('hidden');
+    document.getElementById('precompute-progress').classList.remove('hidden');
+    this.precomputeTimer = setInterval(() => this.pollPrecompute(), 2000);
+    this.showFeedback('correct', `预处理已启动（${r.workers} 进程）`);
   }
 
-  onLayoutClick(bx, by) {
-    const current = this.board.get(bx, by);
-    if (this.placementColor === 'erase') {
-      this.board.set(bx, by, E);
-    } else {
-      const color = this.placementColor === 'black' ? B : W;
-      if (current === color) {
-        this.board.set(bx, by, E);
-      } else {
-        this.board.set(bx, by, color);
+  async pollPrecompute() {
+    if (!this.precomputeJobId) return;
+    const r = await API.precomputeStatus(this.precomputeJobId);
+    const el = document.getElementById('precompute-stats');
+    const nodes = (r.total_nodes || 0).toLocaleString();
+    const workers = r.workers_active != null ? `${r.workers_active}/${r.workers_total}进程` : '';
+    el.textContent = `${r.status === 'merging' ? '合并中' : '计算中'} ${nodes}节点 ${workers}`;
+    if (r.status === 'done') {
+      this.stopPrecomputePoll();
+      document.getElementById('btn-stop-precompute').classList.add('hidden');
+      document.getElementById('precompute-progress').classList.add('hidden');
+      this.showFeedback('correct', `预处理完成！${r.result || ''} TT=${(r.tt_size||0).toLocaleString()}条`);
+      if (this.problemId) {
+        await API.updateProblem(this.problemId, {precompute_status: 'done', precompute_job_id: this.precomputeJobId});
+        this.problemData.precompute_status = 'done';
       }
+      this.updatePrecomputeButtons();
+    } else if (r.status === 'crashed') {
+      this.stopPrecomputePoll();
+      this.showFeedback('incorrect', '预处理异常终止');
     }
-    this.renderBoard();
   }
 
-  onRegionClick(bx, by) {
-    toggleMaskCell(this.regionMask, bx, by, BOARD_SIZE);
-    this.renderBoard();
+  async stopPrecompute() {
+    if (this.precomputeJobId) {
+      await API.precomputeStop(this.precomputeJobId, this.problemId);
+    }
+    this.stopPrecomputePoll();
+    document.getElementById('btn-stop-precompute').classList.add('hidden');
+    document.getElementById('precompute-progress').classList.add('hidden');
+    document.getElementById('btn-precompute').classList.remove('hidden');
+    this.showFeedback('incorrect', '预处理已停止');
+  }
+
+  stopPrecomputePoll() {
+    if (this.precomputeTimer) { clearInterval(this.precomputeTimer); this.precomputeTimer = null; }
   }
 
   // ============================================================
-  // 解题阶段：手动落子
+  // 落子 + 求解
   // ============================================================
 
   async onSolveClick(bx, by) {
-    if (this.waitingForAI) return;
-    if (this.autoplayTimer) return;
-    if (!this.targetInfo) {
-      this.showFeedback('incorrect', '请先点选目标棋子。');
-      return;
-    }
-    if (!this.regionMask[by * BOARD_SIZE + bx]) {
-      this.showFeedback('incorrect', '该点不在落子点范围内。');
-      return;
-    }
+    if (this.waitingForAI || this.autoplayTimer) return;
+    if (!this.targetInfo) { this.showFeedback('incorrect', '请先确认目标'); return; }
+    if (!this.regionMask[by * BOARD_SIZE + bx]) { this.showFeedback('incorrect', '不在落子区域内'); return; }
     if (this.board.get(bx, by) !== E) return;
-
     this.waitingForAI = true;
-    let r;
-    try {
-      r = await API.play(
-        this.board.toArray(),
-        this.board.lastCapture,
-        bx, by, B,
-        {
-          targetCoord: this.targetInfo ? this.targetInfo.target_coord : null,
-          killTargets: this.killTargets.map(t => t.coord),
-          defendTargets: this.defendTargets.map(t => t.coord),
-        },
-      );
-    } catch (err) {
-      this.waitingForAI = false;
-      this.showFeedback('incorrect', '后端通信失败：' + err.message);
-      return;
-    }
-    this.waitingForAI = false;
-
-    if (!r.ok) {
-      this.showFeedback('incorrect', r.error || '非法落子');
-      return;
-    }
-    this.applyPlayResult(bx, by, B, r);
-    this.logEntry({
-      type: 'move',
-      color: B,
-      main: `黑手动 (${bx},${by})`,
-      step: this.moveCounter,
-      tag: '用户', tagClass: 'tag-probe',
-      meta: '用户手动落子',
+    const r = await API.play(this.board.toArray(), this.board.lastCapture, bx, by, B, {
+      killTargets: this.killTargets.map(t => t.coord),
+      defendTargets: this.defendTargets.map(t => t.coord),
     });
+    this.waitingForAI = false;
+    if (!r.ok) { this.showFeedback('incorrect', r.error || '非法落子'); return; }
+    this.applyPlay(bx, by, B, r);
+    this.logMove(B, bx, by, '用户', false);
     this.autoplayColor = W;
-
-    if (this.checkPostMoveTerminal(r)) return;
-
+    if (this.checkTerminal(r)) return;
     document.getElementById('move-text').textContent = '白棋思考中...';
     this.waitingForAI = true;
     setTimeout(() => this.computeReply(W), 50);
   }
 
-  // 把后端 /api/play 的成功响应应用到本地状态
-  applyPlayResult(x, y, color, r) {
+  async computeReply(color) {
+    const r = await API.solve(
+      this.board.toArray(), this.board.lastCapture,
+      Array.from(this.regionMask), this.targetInfo, color,
+      { cacheId: this.precomputeJobId, maxTimeMs: 300000, maxNodes: 50000000 },
+    );
+    if (!r.move) {
+      this.waitingForAI = false;
+      this.stopAutoplay();
+      this.showFeedback('incorrect', r.result === 'UNPROVEN'
+        ? `未证明（${r.nodes?.toLocaleString()}节点/${(r.elapsed_ms/1000).toFixed(1)}s）` : '无着可下');
+      document.getElementById('move-text').textContent = '对局结束';
+      return;
+    }
+    const pr = await API.play(
+      this.board.toArray(), this.board.lastCapture,
+      r.move.x, r.move.y, color,
+      { killTargets: this.killTargets.map(t => t.coord), defendTargets: this.defendTargets.map(t => t.coord) },
+    );
+    if (!pr.ok) {
+      this.waitingForAI = false; this.stopAutoplay();
+      this.showFeedback('incorrect', `落子(${r.move.x},${r.move.y})非法：${pr.error}`); return;
+    }
+    this.applyPlay(r.move.x, r.move.y, color, pr);
+    this.logMove(color, r.move.x, r.move.y, r.move.certain ? '必胜' : '顽抗', r.move.certain);
+    this.waitingForAI = false;
+    this.autoplayColor = -color;
+    if (this.checkTerminal(pr)) return;
+    document.getElementById('move-text').textContent = `轮到${this.autoplayColor===B?'黑':'白'}棋`;
+  }
+
+  applyPlay(x, y, color, r) {
     this.board.replaceFromArray(r.new_board, r.last_capture);
     this.recordMove(x, y, color);
     this.renderer.lastMove = [x, y, color === B ? 'black' : 'white'];
-    // 更新多目标高亮
+    // 更新目标群坐标（可能因提子/合并变化）
     if (r.multi_status) {
-      this._updateMultiHighlightFromStatus(r.multi_status);
-    } else if (r.target_status) {
-      this.renderer.targetGroupCoords = r.target_status.group;
+      (r.multi_status.kill_statuses || []).forEach((s, i) => {
+        if (s && s.group && this.killTargets[i]) this.killTargets[i].group = s.group;
+      });
+      (r.multi_status.defend_statuses || []).forEach((s, i) => {
+        if (s && s.group && this.defendTargets[i]) this.defendTargets[i].group = s.group;
+      });
+      this.syncTargetHighlight();
     }
     this.hideFeedback();
-    this.renderBoard();
+    this.render();
   }
 
-  _updateMultiHighlightFromStatus(ms) {
-    // 用后端返回的最新群坐标更新渲染
-    if (ms.kill_statuses) {
-      for (let i = 0; i < this.killTargets.length && i < ms.kill_statuses.length; i++) {
-        const s = ms.kill_statuses[i];
-        if (s && s.group) this.killTargets[i].group = s.group;
-      }
+  checkTerminal(r) {
+    if (!r.multi_status) return false;
+    const t = r.multi_status.terminal;
+    if (t === 'ATTACKER_WINS') {
+      this.showFeedback('correct', '所有杀目标被提子，攻方胜！');
+      this.logTerminal('攻方胜'); this.stopAutoplay(); return true;
     }
-    if (ms.defend_statuses) {
-      for (let i = 0; i < this.defendTargets.length && i < ms.defend_statuses.length; i++) {
-        const s = ms.defend_statuses[i];
-        if (s && s.group) this.defendTargets[i].group = s.group;
-      }
-    }
-    this.syncMultiTargetHighlight();
-  }
-
-  // 由 multi_status 或 target_status 判断是否到达棋盘终局
-  checkPostMoveTerminal(r) {
-    // 优先使用多目标状态
-    if (r.multi_status) {
-      if (r.multi_status.terminal === 'ATTACKER_WINS') {
-        this.showTerminal('TARGET_CAPTURED');
-        return true;
-      }
-      if (r.multi_status.terminal === 'DEFENDER_WINS') {
-        if (r.multi_status.any_defend_captured) {
-          this.showTerminal('DEFEND_LOST');
-        } else {
-          this.showTerminal('TARGET_ALIVE');
-        }
-        return true;
-      }
-      return false;
-    }
-    // 旧单目标兼容
-    if (!r.target_status) return false;
-    if (r.target_status.captured) {
-      this.showTerminal('TARGET_CAPTURED');
-      return true;
-    }
-    if (r.target_status.alive) {
-      this.showTerminal('TARGET_ALIVE');
-      return true;
+    if (t === 'DEFENDER_WINS') {
+      const msg = r.multi_status.defend_statuses?.some(s => s?.captured)
+        ? '守目标被提，攻方保护失败' : '杀目标做活，防方胜';
+      this.showFeedback('incorrect', msg);
+      this.logTerminal('防方胜'); this.stopAutoplay(); return true;
     }
     return false;
   }
 
-  // ============================================================
-  // 解题阶段：调 solver 应手
-  // ============================================================
-
-  async computeReply(color) {
-    let r;
-    try {
-      r = await API.solve(
-        this.board.toArray(),
-        this.board.lastCapture,
-        Array.from(this.regionMask),
-        this.targetInfo,
-        color,
-        SOLVE_OPTIONS,
-      );
-    } catch (err) {
-      this.waitingForAI = false;
-      this.stopAutoplay();
-      this.showFeedback('incorrect', '后端通信失败：' + err.message);
-      return;
+  recordMove(x, y, color) {
+    for (let i = this.moveHistory.length - 1; i >= 0; i--) {
+      const m = this.moveHistory[i];
+      if ((this.board.get(m.x, m.y) !== m.color) || (m.x === x && m.y === y))
+        this.moveHistory.splice(i, 1);
     }
-    this.displaySolveMeta(r);
-
-    if (!r.move) {
-      // UNPROVEN 无着 → 显示信息但不停自动对弈（让用户看到原因）
-      if (r.result === 'UNPROVEN') {
-        const reason = r.timed_out ? '超时' : '节点上限';
-        const pnStr = r.pn >= 1e9 ? '∞' : r.pn;
-        const dnStr = r.dn >= 1e9 ? '∞' : r.dn;
-        this.showFeedback('incorrect',
-          `未能证明（${reason}）· ${r.nodes.toLocaleString()} 节点 / ${(r.elapsed_ms/1000).toFixed(1)}s` +
-          ` · pn=${pnStr} dn=${dnStr}。建议缩小区域（空位 ≤12）。`);
-      }
-      this.waitingForAI = false;
-      this.stopAutoplay();
-      if (r.result !== 'UNPROVEN') {
-        if (color === this.targetInfo.attacker_color) {
-          this.showFeedback('incorrect', '攻方无合法着法，防方胜。');
-          this.logTerminal('ATK_NO_MOVE');
-        } else {
-          this.showFeedback('correct', '防方无合法着法，攻方胜。');
-          this.logTerminal('DEF_NO_MOVE');
-        }
-      }
-      document.getElementById('move-text').textContent = r.result === 'UNPROVEN' ? '未证明（无着可选）' : '对局结束';
-      return;
-    }
-
-    if (r.move.pass) {
-      this.waitingForAI = false;
-      this.stopAutoplay();
-      this.showFeedback('correct', '防方已安全，无需落子（pass）。');
-      this.logMoveDecision(color, r);
-      this.logTerminal('TARGET_ALIVE');
-      document.getElementById('move-text').textContent = '对局结束';
-      return;
-    }
-
-    // 实际把这一手发给后端 /api/play 应用
-    let pr;
-    try {
-      pr = await API.play(
-        this.board.toArray(),
-        this.board.lastCapture,
-        r.move.x, r.move.y, color,
-        {
-          targetCoord: this.targetInfo ? this.targetInfo.target_coord : null,
-          killTargets: this.killTargets.map(t => t.coord),
-          defendTargets: this.defendTargets.map(t => t.coord),
-        },
-      );
-    } catch (err) {
-      this.waitingForAI = false;
-      this.stopAutoplay();
-      this.showFeedback('incorrect', '后端通信失败：' + err.message);
-      return;
-    }
-    if (!pr.ok) {
-      this.waitingForAI = false;
-      this.stopAutoplay();
-      this.showFeedback('incorrect', `落子(${r.move.x},${r.move.y})非法：${pr.error}`);
-      return;
-    }
-    this.applyPlayResult(r.move.x, r.move.y, color, pr);
-    this.logMoveDecision(color, r);
-
-    this.waitingForAI = false;
-    this.autoplayColor = -color;
-
-    if (this.checkPostMoveTerminal(pr)) return;
-
-    document.getElementById('move-text').textContent =
-      '轮到' + (this.autoplayColor === B ? '黑' : '白') + '棋';
-  }
-
-  // ============================================================
-  // 多目标选择（点白子=杀目标，点黑子=守目标，再点取消）
-  // ============================================================
-
-  enterPickTargetMode() {
-    if (this.mode !== 'solve' && this.mode !== 'pick-target') return;
-    if (this.autoplayTimer) this.stopAutoplay();
-    if (this.waitingForAI) return;
-    this.mode = 'pick-target';
-    // 不清空已选——允许追加/删除
-    this.canvas.style.cursor = 'crosshair';
-    document.getElementById('btn-confirm-target').classList.remove('hidden');
-    document.getElementById('move-text').textContent = '点击棋子设定目标';
-    this.showFeedback('correct',
-      '点白子 → 标为杀目标(红)；点黑子 → 标为守目标(蓝)；再点已选的 → 取消。点空点结束。');
-    this.syncMultiTargetHighlight();
-    this.renderBoard();
-  }
-
-  exitPickTargetMode() {
-    this.mode = 'solve';
-    this.canvas.style.cursor = '';
-    document.getElementById('btn-confirm-target').classList.add('hidden');
-    this.hideFeedback();
-    const hasTarget = this.killTargets.length > 0 || this.defendTargets.length > 0;
-    document.getElementById('move-text').textContent = hasTarget ? '轮到黑棋' : '未选目标';
-  }
-
-  // 同步 renderer 的多目标高亮
-  syncMultiTargetHighlight() {
-    this.renderer.killGroups = this.killTargets.map(t => ({ coords: t.group, coord: t.coord }));
-    this.renderer.defendGroups = this.defendTargets.map(t => ({ coords: t.group, coord: t.coord }));
-    // 清除旧的单目标高亮
-    this.renderer.targetCoord = null;
-    this.renderer.targetGroupCoords = null;
-  }
-
-  // 判断坐标是否已在某个目标列表中（按群判断，不重复添加同群的不同子）
-  _findTargetIndex(list, bx, by) {
-    for (let i = 0; i < list.length; i++) {
-      for (const [gx, gy] of list[i].group) {
-        if (gx === bx && gy === by) return i;
-      }
-    }
-    return -1;
-  }
-
-  async onPickTargetClick(bx, by) {
-    const stone = this.board.get(bx, by);
-    if (stone === E) {
-      // 点空点 → 退出选择模式
-      this.exitPickTargetMode();
-      return;
-    }
-
-    // 检查是否已在某个目标列表中 → 取消
-    const ki = this._findTargetIndex(this.killTargets, bx, by);
-    if (ki >= 0) {
-      this.killTargets.splice(ki, 1);
-      this.syncMultiTargetHighlight();
-      this.updateTargetLabel();
-      this.renderBoard();
-      return;
-    }
-    const di = this._findTargetIndex(this.defendTargets, bx, by);
-    if (di >= 0) {
-      this.defendTargets.splice(di, 1);
-      this.syncMultiTargetHighlight();
-      this.updateTargetLabel();
-      this.renderBoard();
-      return;
-    }
-
-    // 新增：向后端验证
-    let info;
-    try {
-      info = await API.validateTarget(
-        this.board.toArray(),
-        Array.from(this.regionMask),
-        bx, by,
-      );
-    } catch (err) {
-      this.showFeedback('incorrect', '后端通信失败：' + err.message);
-      return;
-    }
-    if (info.error) {
-      this.showFeedback('incorrect', info.error);
-      return;
-    }
-
-    // 按颜色分配：白子→杀目标，黑子→守目标
-    if (info.color === W) {
-      this.killTargets.push(info);
-    } else {
-      this.defendTargets.push(info);
-    }
-    this.syncMultiTargetHighlight();
-    this.updateTargetLabel();
-    this.renderBoard();
-
-    const role = info.color === W ? '杀目标(红)' : '守目标(蓝)';
-    this.showFeedback('correct',
-      `已添加 ${role}：(${bx},${by}) ${info.stones}子/${info.libs}气。继续点击或点空点结束。`);
-  }
-
-  // "确认目标" 按钮
-  confirmMultiTarget() {
-    if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
-      this.showFeedback('incorrect', '至少需要指定一个目标。');
-      return;
-    }
-    // 构造复合 targetInfo（供 solve 使用）
-    this.targetInfo = {
-      attacker_color: B,  // 黑棋是攻方
-      kill_targets_coords: this.killTargets.map(t => t.coord),
-      defend_targets_coords: this.defendTargets.map(t => t.coord),
-      // 旧接口兼容
-      target_coord: this.killTargets.length > 0 ? this.killTargets[0].coord : (
-        this.defendTargets.length > 0 ? this.defendTargets[0].coord : null
-      ),
-    };
-
-    // 恢复初始局面
-    if (this.initialSnapshot) {
-      this.board.replaceFromArray(this.initialSnapshot.boardArr, -1);
-      this.regionMask = cloneMask(this.initialSnapshot.regionMask);
-    }
-    this.moveHistory = [];
-    this.moveCounter = 0;
+    this.moveCounter++;
+    this.moveHistory.push({x, y, color, number: this.moveCounter});
     this.renderer.moveHistory = this.moveHistory;
-    this.renderer.lastMove = null;
-    this.autoplayColor = B;
-    this.initialSnapshot = {
-      boardArr: this.board.toArray(),
-      regionMask: cloneMask(this.regionMask),
-    };
-
-    this.updateTargetLabel();
-    this.decisionLog = [];
-    this.logTargetDecision();
-    this.syncMultiTargetHighlight();
-    this.renderBoard();
-    this.exitPickTargetMode();
   }
 
   // ============================================================
@@ -815,108 +480,139 @@ class App {
   // ============================================================
 
   toggleAutoplay() {
-    if (this.autoplayTimer) {
-      this.stopAutoplay();
-    } else {
-      this.startAutoplay();
-    }
-  }
-
-  startAutoplay() {
-    if (this.mode !== 'solve') return;
-    if (this.waitingForAI) return;
-    if (this.killTargets.length === 0 && this.defendTargets.length === 0) {
-      this.showFeedback('incorrect', '请先设定目标棋子。');
-      return;
-    }
-    if (!this.targetInfo) {
-      this.showFeedback('incorrect', '请先点击"确认目标"。');
-      return;
-    }
-    document.getElementById('btn-autoplay').textContent = '停止自动';
-    this.hideFeedback();
+    if (this.autoplayTimer) { this.stopAutoplay(); return; }
+    if (!this.targetInfo) { this.showFeedback('incorrect', '请先确认目标'); return; }
+    document.getElementById('btn-autoplay').textContent = '停止';
     this.autoplayTimer = true;
-    this.scheduleAutoplayStep(0);
+    this.scheduleStep(0);
   }
 
   stopAutoplay() {
-    if (this.autoplayTimer) {
-      if (typeof this.autoplayTimer === 'number') clearTimeout(this.autoplayTimer);
-      this.autoplayTimer = null;
-    }
+    if (typeof this.autoplayTimer === 'number') clearTimeout(this.autoplayTimer);
+    this.autoplayTimer = null;
     const btn = document.getElementById('btn-autoplay');
     if (btn) btn.textContent = '最优解';
   }
 
-  scheduleAutoplayStep(delayMs) {
+  scheduleStep(ms) {
     if (!this.autoplayTimer) return;
     this.autoplayTimer = setTimeout(async () => {
       if (!this.autoplayTimer) return;
-      await this.autoplayStep();
-      if (this.autoplayTimer) this.scheduleAutoplayStep(2000);
-    }, delayMs);
+      const color = this.autoplayColor;
+      document.getElementById('move-text').textContent = `${color===B?'黑':'白'}棋思考中...`;
+      this.waitingForAI = true;
+      await this.computeReply(color);
+      if (this.autoplayTimer) this.scheduleStep(2000);
+    }, ms);
   }
 
-  async autoplayStep() {
-    if (this.waitingForAI) return;
-    const color = this.autoplayColor;
-    document.getElementById('move-text').textContent =
-      (color === B ? '黑' : '白') + '棋思考中...';
-    this.waitingForAI = true;
-    await this.computeReply(color);
+  // ============================================================
+  // 日志
+  // ============================================================
+
+  logTarget() {
+    const kd = this.killTargets.map(t => `杀(${t.coord[0]},${t.coord[1]})`).join(' ');
+    const dd = this.defendTargets.map(t => `守(${t.coord[0]},${t.coord[1]})`).join(' ');
+    this.decisionLog.push({type:'target', main: `目标：${kd} ${dd}`});
+    this.renderLog();
   }
 
-  showTerminal(type) {
-    if (type === 'TARGET_CAPTURED') {
-      this.showFeedback('correct', '所有杀目标已被提子，攻方胜！');
-    } else if (type === 'TARGET_ALIVE') {
-      this.showFeedback('incorrect', '杀目标做活（2 真眼），防方胜。');
-    } else if (type === 'DEFEND_LOST') {
-      this.showFeedback('incorrect', '守目标被提子，攻方保护失败，防方胜。');
+  logMove(color, x, y, tag, certain) {
+    this.decisionLog.push({
+      type: 'move', color,
+      main: `#${this.moveCounter} ${color===B?'黑':'白'} (${x},${y})`,
+      tag, tagClass: certain ? 'tag-win' : 'tag-resist',
+    });
+    this.renderLog();
+  }
+
+  logTerminal(text) {
+    this.decisionLog.push({type: 'terminal', main: text});
+    this.renderLog();
+  }
+
+  renderLog() {
+    const el = document.getElementById('log-list');
+    if (!el) return;
+    el.innerHTML = this.decisionLog.map(e => {
+      if (e.type === 'target')
+        return `<div class="log-entry entry-target"><div class="log-main">${this.esc(e.main)}</div></div>`;
+      if (e.type === 'move') {
+        const cls = e.color === B ? 'entry-move-black' : 'entry-move-white';
+        const tag = e.tag ? `<span class="log-tag ${e.tagClass}">${e.tag}</span>` : '';
+        return `<div class="log-entry ${cls}"><div class="log-main">${this.esc(e.main)}${tag}</div></div>`;
+      }
+      if (e.type === 'terminal')
+        return `<div class="log-entry entry-terminal"><div class="log-main">${this.esc(e.main)}</div></div>`;
+      return '';
+    }).join('');
+    el.scrollTop = el.scrollHeight;
+  }
+
+  // ============================================================
+  // Canvas 事件
+  // ============================================================
+
+  onCanvasClick(e) {
+    const rect = this.renderer.canvas.getBoundingClientRect();
+    const coord = this.renderer.pixelToBoard(e.clientX - rect.left, e.clientY - rect.top);
+    if (!coord) return;
+    const [bx, by] = coord;
+    if (this.mode === 'layout') this.onLayoutClick(bx, by);
+    else if (this.mode === 'region') this.onRegionClick(bx, by);
+    else if (this.mode === 'pick-target') this.onPickTargetClick(bx, by);
+    else if (this.mode === 'solve') this.onSolveClick(bx, by);
+  }
+
+  onLayoutClick(bx, by) {
+    if (this.placementColor === 'erase') { this.board.set(bx, by, E); }
+    else {
+      const c = this.placementColor === 'black' ? B : W;
+      this.board.set(bx, by, this.board.get(bx, by) === c ? E : c);
     }
-    this.logTerminal(type);
-    document.getElementById('move-text').textContent = '对局结束';
-    this.stopAutoplay();
+    this.render();
   }
 
-  // ============================================================
-  // 鼠标 hover 提示
-  // ============================================================
+  onRegionClick(bx, by) {
+    toggleMaskCell(this.regionMask, bx, by, BOARD_SIZE);
+    this.render();
+  }
 
   onCanvasMouseMove(e) {
-    const rect = this.canvas.getBoundingClientRect();
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
-    const coord = this.renderer.pixelToBoard(px, py);
-
-    if (this.mode === 'layout') {
-      if (coord && this.placementColor !== 'erase' && this.board.get(coord[0], coord[1]) === E) {
-        this.renderer.ghostStone = [coord[0], coord[1], this.placementColor];
-      } else {
-        this.renderer.ghostStone = null;
-      }
-    } else if (this.mode === 'region' || this.mode === 'pick-target') {
+    if (!this.renderer) return;
+    const rect = this.renderer.canvas.getBoundingClientRect();
+    const coord = this.renderer.pixelToBoard(e.clientX - rect.left, e.clientY - rect.top);
+    if (this.mode === 'layout' && coord && this.placementColor !== 'erase' && this.board.get(coord[0], coord[1]) === E)
+      this.renderer.ghostStone = [coord[0], coord[1], this.placementColor];
+    else if (this.mode === 'solve' && coord && !this.waitingForAI && !this.autoplayTimer
+             && this.board.get(coord[0], coord[1]) === E && this.regionMask[coord[1]*BOARD_SIZE+coord[0]])
+      this.renderer.ghostStone = [coord[0], coord[1], 'black'];
+    else
       this.renderer.ghostStone = null;
-    } else {
-      if (this.waitingForAI || this.autoplayTimer) {
-        this.renderer.ghostStone = null;
-      } else if (coord && this.board.get(coord[0], coord[1]) === E
-                 && this.regionMask[coord[1] * BOARD_SIZE + coord[0]]) {
-        this.renderer.ghostStone = [coord[0], coord[1], 'black'];
-      } else {
-        this.renderer.ghostStone = null;
-      }
-    }
-    this.renderBoard();
+    this.render();
   }
 
-  showFeedback(type, message) {
+  // ============================================================
+  // 工具
+  // ============================================================
+
+  setPlacement(color) {
+    this.placementColor = color;
+    document.querySelectorAll('#color-selector .tool-btn').forEach(b => b.classList.remove('active-tool'));
+    const map = {black:'sel-black', white:'sel-white', erase:'sel-erase'};
+    document.getElementById(map[color]).classList.add('active-tool');
+  }
+
+  syncMask() { this.renderer.regionMask = this.regionMask; this.renderer.showMask = (this.mode !== 'layout'); }
+  render() { if (this.renderer) this.renderer.render(this.board); }
+  canvas_cursor(c) { document.getElementById('board-canvas').style.cursor = c; }
+  esc(s) { return s == null ? '' : String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]); }
+
+  showFeedback(type, msg) {
     const el = document.getElementById('feedback');
-    const icon = document.getElementById('feedback-icon');
-    const msg = document.getElementById('feedback-message');
+    document.getElementById('feedback-icon').textContent = type === 'correct' ? '\u2714' : '\u2718';
+    document.getElementById('feedback-message').textContent = msg;
     el.className = 'card feedback-card ' + type;
-    icon.textContent = type === 'correct' ? '\u2714' : '\u2718';
-    msg.textContent = message;
   }
 
   hideFeedback() {
@@ -924,6 +620,4 @@ class App {
   }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-  new App();
-});
+document.addEventListener('DOMContentLoaded', () => new App());

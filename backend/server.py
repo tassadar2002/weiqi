@@ -1,110 +1,43 @@
 """
 weiqi3 后端 HTTP 服务
 
-零外部依赖（仅 Python 3 stdlib）。同一端口同时：
-  - 静态托管 ../frontend/ 目录
-  - 提供 /api/* JSON 接口
+零外部依赖。同一端口托管 frontend/ 静态文件 + /api/* JSON 接口。
 
-启动：
-    python3 backend/server.py
-默认端口 8080；可用 PORT 环境变量覆盖。
-
-API 端点：
-    POST /api/play           落子（验证 + 应用）
-    POST /api/make_target    构造目标群（用户点选）
-    POST /api/inspect_target 查询目标当前状态（活/死/气/眼）
-    POST /api/legal_moves    枚举合法走法（用于前端高亮）
-    POST /api/solve          运行 df-pn 求解，返回最优着
+启动：python3 backend/server.py
 """
 
 import json
+import multiprocessing
 import os
+import re
 import sys
+import time
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any, Dict, List, Optional, Tuple
 
-# 让 backend 目录内的模块可以直接 import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from board import Board
+from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from solver import DfpnSolver
-from target import make_target_from_stone, validate_target_stone
+from precompute import (load_tt_from_sqlite, run_precompute_parallel,
+                        solve_from_cache)
+from problems import (create_problem, delete_problem, get_problem, init_db,
+                       list_problems, update_problem)
+from target import validate_target_stone
 
-
-# 项目根 + 静态目录
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
+PROBLEMS_DB = os.path.join(PROJECT_ROOT, "backend", "data", "problems.db")
+CACHE_DIR = os.path.join(PROJECT_ROOT, "backend", "cache")
 
+# 确保目录和 DB 存在
+os.makedirs(os.path.join(PROJECT_ROOT, "backend", "data"), exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+init_db(PROBLEMS_DB)
 
-# ============================================================
-# 序列化辅助
-# ============================================================
-
-def deserialize_board(grid: List[int], last_capture: int = -1) -> Board:
-    """前端发来的扁平 grid 数组 → Board 实例。"""
-    b = Board(10)
-    b.grid = list(grid)
-    b.last_capture = int(last_capture)
-    return b
-
-
-def serialize_target_status(board: Board,
-                            target_coord: Optional[List[int]]) -> Optional[dict]:
-    """根据当前棋盘 + 单个目标代表子坐标，返回该群的实时状态。"""
-    if target_coord is None:
-        return None
-    target = get_target_group(board, tuple(target_coord))
-    if target is None:
-        return {
-            "captured": True,
-            "alive": False,
-            "group": [],
-            "libs": 0,
-            "real_eyes": 0,
-        }
-    eyes = count_real_eyes(board, target)
-    return {
-        "captured": False,
-        "alive": eyes >= 2,
-        "group": [list(p) for p in target["group"]],
-        "libs": target["lib_count"],
-        "real_eyes": eyes,
-    }
-
-
-def serialize_multi_target_status(board: Board,
-                                  kill_coords: List[List[int]],
-                                  defend_coords: List[List[int]]) -> dict:
-    """返回所有杀目标 + 守目标的实时状态 + 复合终局判定。"""
-    kills = [serialize_target_status(board, c) for c in kill_coords]
-    defends = [serialize_target_status(board, c) for c in defend_coords]
-
-    all_killed = all(s and s["captured"] for s in kills) if kills else False
-    any_kill_alive = any(s and s["alive"] for s in kills)
-    any_defend_captured = any(s and s["captured"] for s in defends)
-
-    terminal = None
-    if any_defend_captured:
-        terminal = "DEFENDER_WINS"
-    elif any_kill_alive:
-        terminal = "DEFENDER_WINS"
-    elif all_killed:
-        terminal = "ATTACKER_WINS"
-
-    return {
-        "kill_statuses": kills,
-        "defend_statuses": defends,
-        "terminal": terminal,
-        "all_killed": all_killed,
-        "any_kill_alive": any_kill_alive,
-        "any_defend_captured": any_defend_captured,
-    }
-
-
-# ============================================================
-# 静态文件 MIME 推断
-# ============================================================
+# 预处理任务
+_JOBS: Dict[str, dict] = {}
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -112,32 +45,55 @@ _MIME = {
     ".js": "application/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
     ".png": "image/png",
-    ".jpg": "image/jpeg",
     ".svg": "image/svg+xml",
     ".ico": "image/x-icon",
 }
 
 
-def guess_mime(path: str) -> str:
-    _, ext = os.path.splitext(path)
-    return _MIME.get(ext.lower(), "application/octet-stream")
+def _board_from(data: dict) -> Board:
+    b = Board(BOARD_SIZE)
+    b.grid = list(data["board"])
+    b.last_capture = int(data.get("last_capture", -1))
+    return b
 
 
-# ============================================================
-# HTTP 处理器
-# ============================================================
+def _target_status(board: Board, coord: Optional[List[int]]) -> Optional[dict]:
+    if coord is None:
+        return None
+    tgt = get_target_group(board, tuple(coord))
+    if tgt is None:
+        return {"captured": True, "alive": False, "group": [], "libs": 0, "real_eyes": 0}
+    eyes = count_real_eyes(board, tgt)
+    return {
+        "captured": False,
+        "alive": eyes >= 2,
+        "group": [list(p) for p in tgt["group"]],
+        "libs": tgt["lib_count"],
+        "real_eyes": eyes,
+    }
 
-class WeiqiHandler(BaseHTTPRequestHandler):
-    server_version = "weiqi3/1.0"
 
-    def log_message(self, format: str, *args: Any) -> None:
-        # 安静一点：只打印有用的请求
-        if args and args[0].startswith("POST /api/"):
-            sys.stderr.write("%s\n" % (args[0],))
+def _multi_status(board: Board, kills: List[List[int]], defends: List[List[int]]) -> dict:
+    ks = [_target_status(board, c) for c in kills]
+    ds = [_target_status(board, c) for c in defends]
+    all_killed = all(s and s["captured"] for s in ks) if ks else False
+    any_alive = any(s and s["alive"] for s in ks)
+    any_def_cap = any(s and s["captured"] for s in ds)
+    terminal = None
+    if any_def_cap: terminal = "DEFENDER_WINS"
+    elif any_alive: terminal = "DEFENDER_WINS"
+    elif all_killed: terminal = "ATTACKER_WINS"
+    return {"kill_statuses": ks, "defend_statuses": ds, "terminal": terminal}
 
-    # ---- 工具方法 ----
 
-    def _send_json(self, status: int, data: dict) -> None:
+class Handler(BaseHTTPRequestHandler):
+    server_version = "weiqi3/2.0"
+
+    def log_message(self, fmt, *args):
+        if args and str(args[0]).startswith("POST /api/"):
+            sys.stderr.write(f"{args[0]}\n")
+
+    def _json(self, status: int, data: Any) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -146,187 +102,270 @@ class WeiqiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json(self) -> dict:
+    def _read(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
-        if length == 0:
-            return {}
-        body = self.rfile.read(length)
-        return json.loads(body.decode("utf-8"))
+        if length == 0: return {}
+        return json.loads(self.rfile.read(length).decode("utf-8"))
 
-    # ---- 路由 ----
+    # ---- Static ----
 
-    def do_GET(self) -> None:
-        path = self.path
-        if path == "/" or path == "":
-            path = "/index.html"
-        # 砍掉 query string
-        if "?" in path:
-            path = path.split("?", 1)[0]
-        # 防路径穿越
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/": path = "/index.html"
+
+        # API: GET /api/problems
+        if path == "/api/problems":
+            self._json(200, {"problems": list_problems(PROBLEMS_DB)})
+            return
+
+        # API: GET /api/problems/{id}
+        m = re.match(r"^/api/problems/([a-f0-9]+)$", path)
+        if m:
+            p = get_problem(PROBLEMS_DB, m.group(1))
+            if p: self._json(200, p)
+            else: self._json(404, {"error": "not found"})
+            return
+
+        # Static files
         if ".." in path:
-            self.send_error(403, "Forbidden")
-            return
-        file_path = os.path.join(FRONTEND_DIR, path.lstrip("/"))
-        if not os.path.isfile(file_path):
-            self.send_error(404, "Not Found")
-            return
-        try:
-            with open(file_path, "rb") as f:
-                content = f.read()
-        except OSError:
-            self.send_error(500, "Read Error")
-            return
+            self.send_error(403); return
+        fp = os.path.join(FRONTEND_DIR, path.lstrip("/"))
+        if not os.path.isfile(fp):
+            self.send_error(404); return
+        with open(fp, "rb") as f:
+            content = f.read()
+        _, ext = os.path.splitext(fp)
         self.send_response(200)
-        self.send_header("Content-Type", guess_mime(file_path))
+        self.send_header("Content-Type", _MIME.get(ext.lower(), "application/octet-stream"))
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
 
-    def do_POST(self) -> None:
-        try:
-            data = self._read_json()
-        except Exception as e:
-            self._send_json(400, {"error": "invalid JSON: %s" % e})
-            return
+    def do_PUT(self):
+        m = re.match(r"^/api/problems/([a-f0-9]+)$", self.path)
+        if not m:
+            self.send_error(404); return
+        data = self._read()
+        ok = update_problem(PROBLEMS_DB, m.group(1), **data)
+        self._json(200, {"ok": ok})
 
+    def do_DELETE(self):
+        m = re.match(r"^/api/problems/([a-f0-9]+)$", self.path)
+        if not m:
+            self.send_error(404); return
+        ok = delete_problem(PROBLEMS_DB, m.group(1), CACHE_DIR)
+        self._json(200, {"ok": ok})
+
+    def do_POST(self):
         try:
-            if self.path == "/api/play":
-                self._handle_play(data)
-            elif self.path == "/api/make_target":
-                self._handle_make_target(data)
-            elif self.path == "/api/validate_target":
-                self._handle_validate_target(data)
-            elif self.path == "/api/inspect_target":
-                self._handle_inspect_target(data)
-            elif self.path == "/api/legal_moves":
-                self._handle_legal_moves(data)
-            elif self.path == "/api/solve":
-                self._handle_solve(data)
+            data = self._read()
+        except Exception as e:
+            self._json(400, {"error": str(e)}); return
+        path = self.path
+        try:
+            if path == "/api/problems":
+                self._h_create_problem(data)
+            elif path == "/api/play":
+                self._h_play(data)
+            elif path == "/api/validate_target":
+                self._h_validate_target(data)
+            elif path == "/api/legal_moves":
+                self._h_legal_moves(data)
+            elif path == "/api/solve":
+                self._h_solve(data)
+            elif path == "/api/precompute/start":
+                self._h_precompute_start(data)
+            elif path == "/api/precompute/status":
+                self._h_precompute_status(data)
+            elif path == "/api/precompute/stop":
+                self._h_precompute_stop(data)
             else:
-                self.send_error(404, "Unknown API endpoint")
+                self.send_error(404)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self._send_json(500, {"error": str(e)})
+            import traceback; traceback.print_exc()
+            self._json(500, {"error": str(e)})
 
-    # ---- API 实现 ----
+    # ---- Problems ----
 
-    def _handle_play(self, data: dict) -> None:
-        board = deserialize_board(data["board"], data.get("last_capture", -1))
-        x = int(data["x"])
-        y = int(data["y"])
-        color = int(data["color"])
+    def _h_create_problem(self, data):
+        pid = create_problem(PROBLEMS_DB, data.get("name", "未命名习题"),
+                             data.get("board_grid"))
+        p = get_problem(PROBLEMS_DB, pid)
+        self._json(200, p)
+
+    # ---- Play ----
+
+    def _h_play(self, data):
+        board = _board_from(data)
+        x, y, color = int(data["x"]), int(data["y"]), int(data["color"])
         u = board.play_undoable(x, y, color)
         if u is None:
-            self._send_json(200, {
-                "ok": False,
-                "error": "非法落子（自杀或打劫禁着）",
-            })
-            return
-        # 支持单目标（旧）和多目标（新）
-        kill_coords = data.get("kill_targets", [])
-        defend_coords = data.get("defend_targets", [])
-        single_coord = data.get("target_coord")
+            self._json(200, {"ok": False, "error": "非法落子"}); return
+        kills = data.get("kill_targets", [])
+        defends = data.get("defend_targets", [])
         resp = {
             "ok": True,
             "new_board": board.grid,
             "last_capture": board.last_capture,
             "captured_count": len(u.captured),
         }
-        if kill_coords or defend_coords:
-            resp["multi_status"] = serialize_multi_target_status(board, kill_coords, defend_coords)
-        if single_coord:
-            resp["target_status"] = serialize_target_status(board, single_coord)
-        self._send_json(200, resp)
+        if kills or defends:
+            resp["multi_status"] = _multi_status(board, kills, defends)
+        self._json(200, resp)
 
-    def _handle_make_target(self, data: dict) -> None:
-        board = deserialize_board(data["board"], data.get("last_capture", -1))
-        region = data["region"]
-        x = int(data["x"])
-        y = int(data["y"])
-        result = make_target_from_stone(board, region, x, y)
-        # 附加 target_status 便于前端立即展示当前群
-        if "error" not in result:
-            result["target_status"] = serialize_target_status(board, result["target_coord"])
-        self._send_json(200, result)
+    def _h_validate_target(self, data):
+        board = _board_from(data)
+        self._json(200, validate_target_stone(board, data["region"], int(data["x"]), int(data["y"])))
 
-    def _handle_validate_target(self, data: dict) -> None:
-        """验证单个棋子是否可作为目标（不区分杀/守，由前端决定）。"""
-        board = deserialize_board(data["board"], data.get("last_capture", -1))
-        region = data["region"]
-        x = int(data["x"])
-        y = int(data["y"])
-        result = validate_target_stone(board, region, x, y)
-        self._send_json(200, result)
+    def _h_legal_moves(self, data):
+        board = _board_from(data)
+        moves = board.legal_moves_in_region(int(data["color"]), data["region"])
+        self._json(200, {"moves": [list(m) for m in moves]})
 
-    def _handle_inspect_target(self, data: dict) -> None:
-        board = deserialize_board(data["board"], data.get("last_capture", -1))
-        target_coord = data.get("target_coord")
-        status = serialize_target_status(board, target_coord)
-        self._send_json(200, status or {})
+    # ---- Solve (查表) ----
 
-    def _handle_legal_moves(self, data: dict) -> None:
-        board = deserialize_board(data["board"], data.get("last_capture", -1))
-        region = data["region"]
-        color = int(data["color"])
-        moves = board.legal_moves_in_region(color, region)
-        self._send_json(200, {"moves": [list(m) for m in moves]})
-
-    def _handle_solve(self, data: dict) -> None:
-        board = deserialize_board(data["board"], data.get("last_capture", -1))
-        region = data["region"]
+    def _h_solve(self, data):
+        board = _board_from(data)
         target = data["target"]
-        attacker_color = int(target["attacker_color"])
         turn = int(data["turn"])
-        max_time_ms = int(data.get("max_time_ms", 60_000))
+        attacker = int(target["attacker_color"])
+        kill_coords = [tuple(c) for c in target.get("kill_targets_coords", [])]
+        defend_coords = [tuple(c) for c in target.get("defend_targets_coords", [])]
+        region = data["region"]
+
+        # 检查预处理缓存
+        cache_id = data.get("precompute_cache_id")
+        if cache_id:
+            job = _JOBS.get(cache_id)
+            if job and os.path.exists(job["db_path"]):
+                tt = load_tt_from_sqlite(job["db_path"])
+                result = solve_from_cache(tt, board, turn, region, attacker)
+                result["cached"] = True
+                result["multi_status"] = _multi_status(
+                    board, [list(c) for c in kill_coords], [list(c) for c in defend_coords])
+                self._json(200, result)
+                return
+
+        # 无缓存：在线 df-pn（有时间限制）
+        from solver import DfpnSolver
+        max_time = int(data.get("max_time_ms", 60_000))
         max_nodes = int(data.get("max_nodes", 5_000_000))
-        max_depth = int(data.get("max_depth", 60))
-
-        # 解析多目标（新）或单目标（旧兼容）
-        kill_targets = [tuple(c) for c in target.get("kill_targets_coords", [])]
-        defend_targets = [tuple(c) for c in target.get("defend_targets_coords", [])]
-        # 旧接口兼容：若无多目标字段，从 target_coord 构造
-        if not kill_targets and not defend_targets and "target_coord" in target:
-            tc = tuple(target["target_coord"])
-            # 旧语义：target_coord 指向防方群 = 攻方要杀
-            kill_targets = [tc]
-
         solver = DfpnSolver(
-            board, region,
-            attacker_color=attacker_color,
-            kill_targets=kill_targets,
-            defend_targets=defend_targets,
-            max_nodes=max_nodes,
-            max_time_ms=max_time_ms,
-            max_depth=max_depth,
+            board, region, attacker_color=attacker,
+            kill_targets=list(kill_coords), defend_targets=list(defend_coords),
+            max_nodes=max_nodes, max_time_ms=max_time,
         )
-        result = solver.solve(turn)
+        r = solver.solve(turn)
+        # 从 TT 提取最优着
+        r["move"] = self._extract_move(solver, board, turn, region, attacker)
+        r["cached"] = False
+        r["multi_status"] = _multi_status(
+            board, [list(c) for c in kill_coords], [list(c) for c in defend_coords])
+        self._json(200, r)
 
-        # 附多目标实时状态
-        kill_coords = [list(c) for c in kill_targets]
-        defend_coords = [list(c) for c in defend_targets]
-        result["multi_status"] = serialize_multi_target_status(board, kill_coords, defend_coords)
-        # 兼容旧接口
-        if kill_targets:
-            result["target_status"] = serialize_target_status(board, list(kill_targets[0]))
-        self._send_json(200, result)
+    def _extract_move(self, solver, board, turn, region, attacker):
+        """从 solver 的 TT 中提取最优着（含顽抗着逻辑）。"""
+        is_or = (turn == attacker)
+        winning = None
+        resist_move = None
+        resist_score = -1
+        any_move = None
+        for x, y in board.legal_moves_in_region(turn, region):
+            if any_move is None: any_move = (x, y)
+            u = board.play_undoable(x, y, turn)
+            if u is None: continue
+            cpn, cdn = solver._tt_get(-turn)
+            board.undo(u)
+            if is_or and cpn == 0:
+                return {"x": x, "y": y, "certain": True}
+            elif not is_or and cdn == 0:
+                return {"x": x, "y": y, "certain": True}
+            score = cpn if is_or else cdn
+            if score > resist_score:
+                resist_score = score
+                resist_move = (x, y)
+        if resist_move:
+            return {"x": resist_move[0], "y": resist_move[1], "certain": False}
+        if any_move:
+            return {"x": any_move[0], "y": any_move[1], "certain": False}
+        return None
+
+    # ---- Precompute ----
+
+    def _h_precompute_start(self, data):
+        job_id = uuid.uuid4().hex[:12]
+        db_path = os.path.join(CACHE_DIR, f"{job_id}.db")
+        progress_path = os.path.join(CACHE_DIR, f"{job_id}_progress.json")
+        p = multiprocessing.Process(target=run_precompute_parallel, args=(
+            data["board"], data.get("last_capture", -1),
+            data["region"], data["kill_targets"], data["defend_targets"],
+            int(data["attacker_color"]), int(data.get("turn", 1)),
+            db_path, progress_path, None,
+        ))
+        p.start()
+        _JOBS[job_id] = {"process": p, "db_path": db_path, "progress_path": progress_path}
+        # 关联到习题
+        if "problem_id" in data:
+            update_problem(PROBLEMS_DB, data["problem_id"],
+                           precompute_status="running", precompute_job_id=job_id)
+        self._json(200, {"job_id": job_id, "workers": max(1, multiprocessing.cpu_count() - 1)})
+
+    def _h_precompute_status(self, data):
+        job_id = data["job_id"]
+        job = _JOBS.get(job_id)
+        if not job:
+            self._json(200, {"status": "not_found"}); return
+        try:
+            with open(job["progress_path"]) as f:
+                progress = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            progress = {"status": "starting", "total_nodes": 0}
+        if not job["process"].is_alive() and progress.get("status") not in ("done", "merging"):
+            progress["status"] = "done" if os.path.exists(job["db_path"]) else "crashed"
+        # 检查 DB 是否已合并完成
+        if progress.get("status") in ("done", "merging") and os.path.exists(job["db_path"]):
+            try:
+                import sqlite3
+                db = sqlite3.connect(job["db_path"])
+                result = db.execute("SELECT value FROM metadata WHERE key='result'").fetchone()
+                tt_size = db.execute("SELECT value FROM metadata WHERE key='tt_size'").fetchone()
+                db.close()
+                if result:
+                    progress["status"] = "done"
+                    progress["result"] = result[0]
+                    progress["tt_size"] = int(tt_size[0]) if tt_size else 0
+            except Exception:
+                pass
+        self._json(200, progress)
+
+    def _h_precompute_stop(self, data):
+        job_id = data["job_id"]
+        job = _JOBS.get(job_id)
+        if job and job["process"].is_alive():
+            job["process"].terminate()
+            job["process"].join(timeout=5)
+        if "problem_id" in data:
+            update_problem(PROBLEMS_DB, data["problem_id"], precompute_status="none")
+        self._json(200, {"ok": True})
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
 
-# ============================================================
-# 启动
-# ============================================================
-
-def main() -> None:
+def main():
     port = int(os.environ.get("PORT", "8080"))
-    addr = ("127.0.0.1", port)
-    httpd = HTTPServer(addr, WeiqiHandler)
-    print(f"weiqi3 backend listening on http://{addr[0]}:{addr[1]}/")
-    print(f"  static dir: {FRONTEND_DIR}")
-    print(f"  press Ctrl-C to stop")
+    httpd = HTTPServer(("127.0.0.1", port), Handler)
+    print(f"weiqi3 on http://127.0.0.1:{port}/")
+    print(f"  frontend: {FRONTEND_DIR}")
+    print(f"  problems: {PROBLEMS_DB}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nshutdown")
+        print("\nbye")
 
 
 if __name__ == "__main__":
