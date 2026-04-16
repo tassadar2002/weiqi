@@ -15,7 +15,7 @@
 
 ### 1. Zobrist 增量哈希 — 替换 `board.hash()`
 
-**文件**: `backend/board.py`, `backend/solver.py`, `backend/bincache.py`
+**文件**: `backend/board.py`, `backend/precompute/solver.py`, `backend/precompute/binstore.py`
 
 **改动**:
 - `board.py` 模块级：用固定种子生成 `ZOBRIST[169][3]` 表（64位随机数，index 0/1/2 对应 EMPTY/BLACK/WHITE）
@@ -28,7 +28,7 @@
 - `solver.py`：`_tt_key` 改为返回 `(self.board.zh, turn, self.board.last_capture)` 元组
 - TT 类型从 `Dict[str, ...]` 改为 `Dict[tuple, ...]`
 
-- `bincache.py`：`_flush_tt` 和 `solve_from_cache` 中的 TT key 同步改为元组
+- `binstore.py`：`_flush_tt` 和 `solve_from_store` 中的 TT key 同步改为元组
 - SQLite 存储 key 时用 `f"{zh}|{turn}|{lc}"` 字符串（仅在 flush 时转换，不影响内存中查表速度）
 
 **预期**: TT 读写速度 ~3x 提升（int tuple hash ~30ns vs 175-char string ~2-4μs）
@@ -53,12 +53,12 @@
 
 ### 3. 修复 `_flush_tt` 的 O(N) 灾难
 
-**文件**: `backend/solver.py`, `backend/bincache.py`
+**文件**: `backend/precompute/solver.py`, `backend/precompute/binstore.py`
 
 **改动**:
 - `DfpnSolver` 新增 `self.tt_log: list = []`（记录新增 key 的有序列表）
 - `_tt_set` 中：如果 key 不在 tt 中，`self.tt_log.append(key)`
-- `bincache.py` 的 `_flush_tt` 改为：
+- `binstore.py` 的 `_flush_tt` 改为：
   ```python
   new_keys = solver.tt_log[already_flushed:]
   db.executemany(..., ((str(k), solver.tt[k][0], solver.tt[k][1]) for k in new_keys))
@@ -85,7 +85,7 @@
 
 ### 5. Worker 负载均衡 — LPT 调度
 
-**文件**: `backend/precompute.py`
+**文件**: `backend/precompute/coordinator.py` + `backend/precompute/worker.py`
 
 **改动**:
 - `run_precompute_parallel` 在分桶前，对每个根候选做浅探（max_nodes=500）估算难度
@@ -101,7 +101,7 @@
 
 ### 6. 1+ε Trick — 减少子节点切换开销
 
-**文件**: `backend/solver.py`
+**文件**: `backend/precompute/solver.py`
 
 **问题**：`_mid` 的 while 循环中，子节点预算用 `second_best + 1`，当两个子节点 pn/dn 接近时产生"乒乓球"现象——反复切换，每次只做极少有效搜索，但每次切换都要付出 `_aggregate` 的 O(N) play/hash/undo 开销。
 
@@ -134,7 +134,7 @@ th_dn_c = min(th_dn, int(second_best * 1.25) + 1)
 
 ### 7. Killer Move 排序 — 搜索经验指导走法顺序
 
-**文件**: `backend/solver.py`
+**文件**: `backend/precompute/solver.py`
 
 **问题**：`_gen_children` 只用静态信号排序（提子数+邻近棋子数），与搜索经验无关。df-pn 第一轮 `_aggregate` 时所有子节点 TT 值都是 (1,1)，默认选第一个。如果好着排在后面，要浪费大量节点才能通过 TT 值更新找到它。
 
@@ -212,12 +212,12 @@ kids = self._gen_children(turn, allow_pass=not is_or, depth=depth)
 1. 单元测试：用已知题目跑 solver，对比优化前后的 result（必须一致）
 2. 性能对比：同一题目记录优化前后 nodes/sec
 3. 预处理端到端：`python3 backend/cli_precompute.py run <id>`，观察终端进度显示的 n/s 指标
-4. 正确性：Zobrist hash 后 `solve_from_cache` 结果与原 string hash 一致
+4. 正确性：Zobrist hash 后 `solve_from_store` 结果与原 string hash 一致
 
 ## 关键文件
 
 - `backend/board.py` — Zobrist 表、zh 字段、_visited 缓冲区、count_libs_fast
-- `backend/solver.py` — 1+ε trick、killer move、tt_key 改元组、tt_log 增量记录
-- `backend/bincache.py` — flush 修复、solve_from_cache 适配
-- `backend/precompute.py` — LPT 调度、worker 求解
+- `backend/precompute/solver.py` — 1+ε trick、killer move、tt_key 改元组、tt_log 增量记录
+- `backend/precompute/binstore.py` — flush 修复、solve_from_store 适配
+- `backend/precompute/coordinator.py` + `backend/precompute/worker.py` — LPT 调度、worker 求解
 - `backend/eyes.py` — 无需修改

@@ -1,11 +1,11 @@
 """
-df-pn 求解器（简化版，面向预处理）
+df-pn 求解器（预处理阶段使用）
 
-职责：穷举证明。不含跨请求缓存、vitalness、穷举根证明等在线优化。
-预处理完成后查询走 solve_from_store（在 binstore.py 中）。
+职责：在 Worker 进程内穷举证明单个根着子树。
+在线查表由 solve_from_store（binstore.py）处理，不会重新调用本求解器。
 
 保留：
-  - TT 转置表（df-pn 核心）
+  - TT 转置表（df-pn 核心；由 DiskTT 提供内存+磁盘两级存储）
   - 走法排序（提子优先，加快收敛）
   - progress_callback（报告进度）
   - try/finally 保护 play/undo

@@ -181,9 +181,10 @@ T38                       W0: A 最终完成?     (看队列是否还有 A)
 
 | 文件 | 改动 |
 |------|------|
-| `backend/binstore.py` | 新增 `DiskTT`、`_calc_max_tt_entries()`、`_calc_num_workers()`、`_merge_flush()` |
-| `backend/solver.py` | `__init__` 新增 `tt` 参数；`_tt_get`/`_tt_set`/`_check_limits` 适配 DiskTT |
-| `backend/precompute.py` | 重写：`_worker_loop`（无状态）、`run_precompute_parallel`（事件循环 + 崩溃恢复）；删除静态分桶 |
+| `backend/precompute/binstore.py` | 新增 `DiskTT`、`_calc_max_tt_entries()`、`_calc_num_workers()`、`_merge_flush()` |
+| `backend/precompute/solver.py` | `__init__` 新增 `tt` 参数；`_tt_get`/`_tt_set`/`_check_limits` 适配 DiskTT |
+| `backend/precompute/coordinator.py` | 事件循环、任务队列、崩溃恢复（原 `run_precompute_parallel`） |
+| `backend/precompute/worker.py` | 无状态 worker 主循环（原 `_worker_loop`） |
 
 ## DiskTT flush 机制详解
 

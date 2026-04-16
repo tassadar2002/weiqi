@@ -52,7 +52,7 @@ class RunAction(Action):
         print(f"题目: {p['name']} ({args.problem_id})")
         print(f"杀目标: {p['kill_targets']}  守目标: {p['defend_targets']}")
         print(f"job_id: {job_id}{'  (断点续传)' if resume else ''}")
-        print(f"缓存: {bin_path}")
+        print(f"预处理结果: {bin_path}")
         if resume:
             print(f"已有 {len(done_bins)} 个根着 .bin 文件")
         print()

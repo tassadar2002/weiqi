@@ -1,5 +1,13 @@
 # 前后端分离后的操作纪要
 
+> ⚠️ **历史文档**。本文记录 v1→v2 迁移阶段的后端设计与优化过程，
+> 涉及的 10×10 棋盘、`/api/make_target`、`/api/inspect_target`、单体 `solver.py`、
+> 请求内在线 TT 缓存等均已在后续版本中替换。
+> **当前状态以 `README.md` / `CLAUDE.md` 为准**：
+> - 13×13 棋盘、多目标（kill/defend）
+> - 预处理离线穷举 → 二进制存储；`/api/solve` 只做查表
+> - `solver.py` 移入 `backend/precompute/`，不再有跨请求内存缓存
+
 本文记录 weiqi3 项目从单文件 JS 版（v1）迁移到 Python 后端 + 浏览器前端（v2）后，
 所有后端相关的改动、问题与优化过程。目标读者：后续接手者。
 

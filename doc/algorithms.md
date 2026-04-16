@@ -2,6 +2,11 @@
 
 从项目启动到当前状态，所有使用过、尝试过、弃用过的算法和优化手段。
 
+> ⚠️ **部分内容已过时**。下方 "跨请求 TT 缓存"、"穷举根证明"、"Vitalness" 等章节描述的是单体
+> `solver.py` 在线求解时代的优化；当前架构把穷举移到离线预处理，`/api/solve` 只查
+> `backend/precompute/binstore.py::solve_from_store`，这些优化已无对应代码路径。
+> df-pn 主算法（TT、killer、1+ε trick 等）仍然适用于 `precompute/solver.py`。
+
 ---
 
 ## 一、搜索算法

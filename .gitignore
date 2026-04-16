@@ -79,6 +79,5 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-backend/cache
 backend/store
 backend/data

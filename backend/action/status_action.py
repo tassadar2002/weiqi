@@ -59,19 +59,19 @@ def _read_progress(path: str) -> Optional[dict]:
 
 def _print_bin_info(bin_path: str) -> None:
     if not os.path.exists(bin_path):
-        print(f"缓存文件: 不存在")
+        print(f"预处理结果: 不存在")
         return
     size_mb = os.path.getsize(bin_path) / (1024 * 1024)
     hdr = _read_header(bin_path)
     if hdr and hdr["status"] == 1:
-        print(f"缓存文件: {bin_path} ({size_mb:.2f} MB)")
+        print(f"预处理结果: {bin_path} ({size_mb:.2f} MB)")
         print(f"结果: {hdr['result']}")
         print(f"TT 条目: {hdr['count']:,}")
         print(f"根节点 pn={hdr['root_pn']}  dn={hdr['root_dn']}")
     elif hdr and hdr["status"] == 2:
-        print(f"缓存文件: {bin_path} (失败标记)")
+        print(f"预处理结果: {bin_path} (失败标记)")
     else:
-        print(f"缓存文件: {bin_path} ({size_mb:.2f} MB, 未完成)")
+        print(f"预处理结果: {bin_path} ({size_mb:.2f} MB, 未完成)")
 
 
 def _print_overall_progress(prog: dict) -> None:

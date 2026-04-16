@@ -173,9 +173,9 @@ class BinStore:
 
 ## 涉及文件
 
-- `backend/binstore.py` — 二进制格式定义、BinStore mmap 查表、k-way 合并
-- `backend/coordinator.py` — coordinator 调度
-- `backend/worker.py` — Worker 写入
+- `backend/precompute/binstore.py` — 二进制格式定义、BinStore mmap 查表、k-way 合并、DiskTT
+- `backend/precompute/coordinator.py` — coordinator 调度
+- `backend/precompute/worker.py` — Worker 写入
 - `backend/server.py` — 使用 BinStore 查表
 - `backend/board.py` — Zobrist hash、rebuild_zh()
-- `backend/solver.py` — tt_log 增量记录
+- `backend/precompute/solver.py` — tt_log 增量记录

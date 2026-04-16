@@ -9,8 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Core Concept
 
 Users layout Go problems (黑白子布局) → set playable regions → specify target stones → run exhaustive df-pn solver → get proven optimal moves. Two solving modes:
-1. **Precomputation**: Multi-process background exhaustive search with binary SQLite cache (mmap + 6.3x compression)
-2. **Table lookup**: Sub-millisecond queries after precomputation complete
+1. **Precomputation**: Multi-process background exhaustive search writing a binary store (mmap + 6.3x compression vs. dict)
+2. **Table lookup**: Sub-millisecond queries against the binary store after precomputation completes
 
 ## Architecture & Structure
 
@@ -32,14 +32,16 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 │  server.py: HTTP service (http.server stdlib)  │
 │  ├─ board.py: rules engine + undo-stack        │
 │  ├─ precompute/solver.py: df-pn main loop + TT │
-│  ├─ precompute/binstore.py: binary store format │
-│  ├─ precompute.py: multi-process coordinator   │
-│  ├─ cli_precompute.py: precompute CLI          │
+│  ├─ precompute/binstore.py: binary store + DiskTT │
+│  ├─ precompute/coordinator.py: multi-process orchestration │
+│  ├─ precompute/worker.py: stateless worker     │
+│  ├─ cli_precompute.py: CLI entry point         │
+│  ├─ action/: CLI subcommand classes (list/status/run) │
 │  ├─ problems.py: problem CRUD (SQLite)         │
 │  ├─ eyes.py: strict true-eye detection         │
 │  └─ target.py: target validation               │
 │                                                 │
-│ Persistence: SQLite (problems.db + job caches) │
+│ Persistence: SQLite problems.db + per-job binary store in backend/store/ │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -53,17 +55,17 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 
 4. **Epoch-based visited tracking**: Module-level `bytearray` + epoch counter replaces `Set` allocation per traversal.
 
-5. **Multi-process root-splitting** (`precompute.py`): Coordinator generates root candidates; each worker solves assigned subtree → worker-local .bin → merge. Avoids lock contention.
+5. **Multi-process root-splitting** (`precompute/coordinator.py` + `precompute/worker.py`): Coordinator enumerates root candidates and hands them out via a task queue; each worker solves one root → worker-local `.bin` → merge into the job's final `.bin`. Work-stealing; crash recovery via `{job_id}_pids.json` and bin status byte.
 
-6. **Binary TT cache format** (`binstore.py`): Sorted 12-byte records (8B key + 2B pn + 2B dn) in `.bin` files; mmap + binary search for O(log n) lookup with ~0 memory overhead.
+6. **Binary store format** (`precompute/binstore.py`): Sorted 12-byte records (8B key + 2B pn + 2B dn) in `.bin` files; mmap + binary search for O(log n) lookup with ~0 memory overhead.
 
 7. **Stateless HTTP API**: Each request includes full board state (169 integers for 13×13). No per-session state on backend; enables horizontal scaling and resilience.
 
 8. **Two-mode solving**:
    - Precompute: Exhaustive, infinite time/node budget, no cutoff
-   - Lookup: Post-precompute, TT cache only, <1ms response
+   - Lookup: Post-precompute, binary store queries only, <1ms response
    
-   These modes have fundamentally different logic; lookup mode **never runs df-pn**, only queries the binary cache via mmap.
+   These modes have fundamentally different logic; lookup mode **never runs df-pn**, only queries the binary store via mmap.
 
 ### Frontend FSM States
 
@@ -83,8 +85,8 @@ The solver supports two phases:
 2. User sets region → region_mask (169 ints: 0/1)
 3. User picks target stone → validated via `POST /api/validate_target` → target_info (group, libs, eyes, attacker_color)
 4. User confirms target → auto-save → back to list
-5. CLI: `cli_precompute.py run <id>` → spawns workers, each writes sorted `.bin` shard → k-way merge → final `{job_id}.bin`
-6. User clicks "最优解" → `POST /api/solve` mmap-opens cache, binary-search lookups best move
+5. CLI: `cli_precompute.py run <id>` → Coordinator dispatches root moves to Workers; each worker writes a per-root sorted `.bin` → k-way merge → final `{job_id}.bin`
+6. User clicks "最优解" → `POST /api/solve` mmap-opens the binary store, binary-search lookups best move
 7. User plays moves → `POST /api/play` updates board, checks legality, reports captures
 
 ## Development Commands
@@ -125,7 +127,7 @@ Tests include:
 cd backend
 python3 -c "
 from board import Board, BLACK
-from solver import DfpnSolver
+from precompute.solver import DfpnSolver
 
 b = Board(13)
 b.set(1, 1, -1)  # White
@@ -177,14 +179,17 @@ The solver terminates a branch when:
 
 | File | Purpose |
 |------|---------|
-| `server.py` | HTTP server, route handlers, cache lookup for solve |
+| `server.py` | HTTP server, route handlers, binary-store lookup via BinStore for `/api/solve` |
 | `board.py` | Board state, play/undo, group+libs, legal move generation |
 | `precompute/solver.py` | df-pn main loop, transposition table, termination checks |
-| `precompute/binstore.py` | Binary store format (.bin), BinStore mmap lookup, solve_from_store, k-way merge |
+| `precompute/binstore.py` | Binary store format (.bin), BinStore mmap lookup, solve_from_store, DiskTT, k-way merge |
 | `precompute/coordinator.py` | Multi-process coordinator (task queue, event loop, crash recovery) |
-| `precompute/worker.py` | Stateless worker (pulls tasks, runs df-pn with DiskTT) |
-| `precompute.py` | Multi-process worker + coordinator (parallel scheduling, progress monitoring) |
-| `cli_precompute.py` | Precompute CLI entry point (list/status/run), progress display, pypy3 switch |
+| `precompute/worker.py` | Stateless worker (pulls root tasks, runs df-pn with DiskTT, writes per-root .bin) |
+| `cli_precompute.py` | CLI entry point; dispatches to `action/` classes |
+| `action/list_action.py` | `list` subcommand |
+| `action/status_action.py` | `status` subcommand (worker table + root-kid table) |
+| `action/run_action.py` | `run` subcommand (auto-switches to pypy3, spawns Coordinator) |
+| `action/base.py` | `Action` base class, path constants, formatters, `ensure_pypy3` |
 | `problems.py` | SQLite schema + CRUD for problem persistence |
 | `eyes.py` | True eye detection (group-specific) |
 | `target.py` | Validate target stone → group representation |
@@ -208,23 +213,20 @@ The solver terminates a branch when:
 - `doc/doc.md` — Historical evolution, algorithm journey (minimax → df-pn), performance optimization
 - `doc/algorithms.md` — df-pn theory & implementation details
 - `doc/backend.md` — API endpoints, database schema, data models
-- `doc/db.md` — Cache optimization (binary format, mmap, compression)
+- `doc/db.md` — Binary store format (sorted records, mmap, compression)
 - `doc/pre_compute01.md` — Multi-process strategy & worker coordination
 
 ## Performance Characteristics
 
-**Python backend is ~20x slower than optimized JS version**:
-- First move (106k nodes): ~10 seconds
-- Later moves: <1 second (search tree shrinks + TT cache)
-- Full 9-move game: ~18 seconds
+**Precompute runs on PyPy3** (required by `cli_precompute.py run`); the HTTP server can run on either CPython or PyPy.
 
 **Performance levers** (if optimization needed):
 1. **Reduce problem size** — User shrinks playable region or picks smaller target
-2. **PyPy** — Drop-in replacement: `pypy3 backend/server.py` (5–10x speedup, no code changes)
-3. **C extensions** — Rewrite `group_and_libs` in C (~5x more)
-4. **Multi-process precompute** — Already implemented for batch solving (2–4x, limited by GIL in df-pn phases)
+2. **PyPy** — Already required for precompute; `pypy3 backend/server.py` also works for the server (5–10× CPython speedup)
+3. **C extensions** — Rewrite `group_and_libs` in C for another ~5× (not currently done)
+4. **Multi-process precompute** — Already implemented; each worker process owns one root move, so scaling is limited by root count rather than GIL
 
-## Database & Caching
+## Persistence
 
 ### Problem Storage
 
@@ -247,13 +249,15 @@ CREATE TABLE problems (
 );
 ```
 
-### Precompute Cache
+### Precompute Store
 
-Per-job binary cache in `backend/store/`:
+Per-job binary store in `backend/store/`:
 - `{job_id}.bin` — Final merged TT (sorted 12-byte records: 8B key + 2B pn + 2B dn); mmap + binary search for O(log n) lookup
-- `{job_id}_w{i}.bin` — Worker i's sorted shard (temporary, deleted after merge)
-- `{job_id}_w{i}_progress.json` — Per-worker real-time stats
-- `{job_id}_pids.json` — Worker process IDs for job management
+- `{job_id}_{x}_{y}.bin` — Per-root-move shard written by a Worker; merged into the final bin, status byte flipped to `1` when proven
+- `{job_id}_worker{i}_progress.json` — Per-worker real-time stats (pid, status, current_move, total_nodes, tasks_done)
+- `{job_id}_progress.json` — Overall progress snapshot (workers, root_kids, elapsed, nodes/sec)
+- `{job_id}_root_moves.json` — Complete enumerated root-move list (used by `status` to show queued roots)
+- `{job_id}_pids.json` — Worker PIDs, consulted on restart to kill orphan workers for crash recovery
 
 ## Testing Strategy
 
@@ -351,7 +355,7 @@ Key points:
 
 3. **Target not in region**: If a target stone is outside the playable region, solver will never reach it. Frontend should prevent this.
 
-4. **TT key mismatch**: If precompute uses different key generation than lookup, cache misses occur silently (looks slow, not wrong).
+4. **TT key mismatch**: If precompute uses different key generation than lookup, store lookups silently miss — `/api/solve` would return "not found" rather than wrong answers.
 
 5. **PyPy3 required for precompute**: `cli_precompute.py run` enforces pypy3 (auto-detects and exec's). Must have pypy3 installed; no python3 fallback for precompute.
 
