@@ -80,5 +80,5 @@ dmypy.json
 .pyre/
 
 backend/cache
-backend/precompute
+backend/store
 backend/data

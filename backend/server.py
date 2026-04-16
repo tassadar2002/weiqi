@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BOARD_SIZE, EMPTY
 from eyes import count_real_eyes, get_target_group
-from binstore import BinStore, solve_from_store
+from precompute.binstore import BinStore, solve_from_store
 from problems import (create_problem, delete_problem, get_problem, init_db,
                        list_problems, update_problem)
 from target import validate_target_stone
@@ -25,11 +25,11 @@ from target import validate_target_stone
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
 PROBLEMS_DB = os.path.join(PROJECT_ROOT, "backend", "data", "problems.db")
-PRECOMPUTE_DIR = os.path.join(PROJECT_ROOT, "backend", "precompute")
+STORE_DIR = os.path.join(PROJECT_ROOT, "backend", "store")
 
 # 确保目录和 DB 存在
 os.makedirs(os.path.join(PROJECT_ROOT, "backend", "data"), exist_ok=True)
-os.makedirs(PRECOMPUTE_DIR, exist_ok=True)
+os.makedirs(STORE_DIR, exist_ok=True)
 init_db(PROBLEMS_DB)
 
 _MIME = {
@@ -147,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/problems/([a-f0-9]+)$", self.path)
         if not m:
             self.send_error(404); return
-        ok = delete_problem(PROBLEMS_DB, m.group(1), PRECOMPUTE_DIR)
+        ok = delete_problem(PROBLEMS_DB, m.group(1), STORE_DIR)
         self._json(200, {"ok": ok})
 
     def do_POST(self):
@@ -224,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
         job_id = data.get("precompute_job_id")
         if not job_id:
             self._json(400, {"error": "需要预处理结果"}); return
-        bin_path = os.path.join(PRECOMPUTE_DIR, f"{job_id}.bin")
+        bin_path = os.path.join(STORE_DIR, f"{job_id}.bin")
         if not os.path.exists(bin_path):
             self._json(400, {"error": "预处理结果不存在"}); return
         with BinStore(bin_path) as store:

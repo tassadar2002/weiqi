@@ -5,8 +5,8 @@ import os
 import sys
 from typing import Optional
 
-from action.base import DB_PATH, PRECOMPUTE_DIR, Action, fmt_duration, fmt_size
-from binstore import _read_header
+from action.base import DB_PATH, STORE_DIR, Action, fmt_duration, fmt_size
+from precompute.binstore import _read_header
 
 
 class StatusAction(Action):
@@ -34,8 +34,8 @@ class StatusAction(Action):
             return
 
         print(f"job_id: {job_id}")
-        bin_path = os.path.join(PRECOMPUTE_DIR, f"{job_id}.bin")
-        progress_path = os.path.join(PRECOMPUTE_DIR, f"{job_id}_progress.json")
+        bin_path = os.path.join(STORE_DIR, f"{job_id}.bin")
+        progress_path = os.path.join(STORE_DIR, f"{job_id}_progress.json")
 
         _print_bin_info(bin_path)
 
@@ -99,7 +99,7 @@ def _print_workers(job_id: str, prog: Optional[dict]) -> None:
         _print_worker_table(worker_data)
         return
 
-    pattern = os.path.join(PRECOMPUTE_DIR, f"{job_id}_worker*_progress.json")
+    pattern = os.path.join(STORE_DIR, f"{job_id}_worker*_progress.json")
     wpaths = sorted(_glob.glob(pattern))
     live_workers = []
     for wp in wpaths:
@@ -195,14 +195,14 @@ def _collect_root_kids_status(job_id: str,
         } for k in prog["root_kids"]]
 
     all_moves = []
-    rm_path = os.path.join(PRECOMPUTE_DIR, f"{job_id}_root_moves.json")
+    rm_path = os.path.join(STORE_DIR, f"{job_id}_root_moves.json")
     try:
         with open(rm_path) as f:
             all_moves = [tuple(m) for m in json.load(f)]
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
 
-    worker_pattern = os.path.join(PRECOMPUTE_DIR,
+    worker_pattern = os.path.join(STORE_DIR,
                                   f"{job_id}_worker*_progress.json")
     in_flight = {}  # (x,y) → (pid, tt_size)
     for wp in _glob.glob(worker_pattern):
@@ -216,7 +216,7 @@ def _collect_root_kids_status(job_id: str,
             in_flight[tuple(cm)] = (wd.get("pid"), wd.get("tt_size", 0))
 
     bin_info = {}  # (x,y) → (status, result, count, size)
-    pattern = os.path.join(PRECOMPUTE_DIR, f"{job_id}_*_*.bin")
+    pattern = os.path.join(STORE_DIR, f"{job_id}_*_*.bin")
     for bp in _glob.glob(pattern):
         base = os.path.basename(bp).replace(f"{job_id}_", "").replace(".bin", "")
         parts = base.split("_")

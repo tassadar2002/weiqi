@@ -8,7 +8,7 @@ import sys, time, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from board import Board, BLACK, WHITE, EMPTY
-from solver import DfpnSolver
+from precompute.solver import DfpnSolver
 
 
 def test_simple_kill():

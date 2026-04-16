@@ -7,7 +7,7 @@ import sys
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 DB_PATH = os.path.join(_PROJECT_ROOT, "backend", "data", "problems.db")
-PRECOMPUTE_DIR = os.path.join(_PROJECT_ROOT, "backend", "precompute")
+STORE_DIR = os.path.join(_PROJECT_ROOT, "backend", "store")
 
 
 class Action:

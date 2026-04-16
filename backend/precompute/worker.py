@@ -11,11 +11,12 @@ import os
 import time
 from typing import List, Optional, Tuple
 
-from binstore import (DFPN_INF, DiskTT, _HEADER_FMT, _MAGIC, _RESULT_MAP,
-                      _read_header)
-from board import BOARD_SIZE, Board
-from solver import DfpnSolver
 import struct
+
+from board import BOARD_SIZE, Board
+from precompute.binstore import (DFPN_INF, DiskTT, _HEADER_FMT, _MAGIC,
+                                  _RESULT_MAP, _read_header)
+from precompute.solver import DfpnSolver
 
 # 默认每段节点预算
 DEFAULT_BUDGET = 5_000_000

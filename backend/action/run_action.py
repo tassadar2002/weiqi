@@ -7,14 +7,14 @@ import sys
 import threading
 import uuid as _uuid
 
-from action.base import DB_PATH, PRECOMPUTE_DIR, Action, fmt_duration
-from binstore import _read_header
+from action.base import DB_PATH, STORE_DIR, Action, fmt_duration
 from board import BLACK
+from precompute.binstore import _read_header
 
 
 class RunAction(Action):
     def run(self, args) -> None:
-        from coordinator import Coordinator
+        from precompute.coordinator import Coordinator
         from problems import get_problem, init_db, update_problem
 
         init_db(DB_PATH)
@@ -29,9 +29,9 @@ class RunAction(Action):
 
         # 复用已有 job_id（断点续传）或创建新的
         job_id = p.get("precompute_job_id") or _uuid.uuid4().hex[:12]
-        os.makedirs(PRECOMPUTE_DIR, exist_ok=True)
-        bin_path = os.path.join(PRECOMPUTE_DIR, f"{job_id}.bin")
-        progress_path = os.path.join(PRECOMPUTE_DIR, f"{job_id}_progress.json")
+        os.makedirs(STORE_DIR, exist_ok=True)
+        bin_path = os.path.join(STORE_DIR, f"{job_id}.bin")
+        progress_path = os.path.join(STORE_DIR, f"{job_id}_progress.json")
 
         # 已完成检查
         if os.path.exists(bin_path):
@@ -39,13 +39,13 @@ class RunAction(Action):
             if hdr and hdr["status"] == 1:
                 print(f"题目 {p['name']} 已完成预处理"
                       f"（{hdr['result']}, TT={hdr['count']:,}）")
-                print(f"如需重新处理，请先删除：rm backend/precompute/{job_id}.bin")
+                print(f"如需重新处理，请先删除：rm backend/store/{job_id}.bin")
                 update_problem(DB_PATH, args.problem_id,
                                precompute_status="done",
                                precompute_job_id=job_id)
                 return
 
-        done_bins = glob.glob(os.path.join(PRECOMPUTE_DIR,
+        done_bins = glob.glob(os.path.join(STORE_DIR,
                                           f"{job_id}_*_*.bin"))
         resume = len(done_bins) > 0
 

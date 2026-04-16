@@ -31,8 +31,8 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 ┌─ Backend (Python 3 stdlib only) ───────────────┐
 │  server.py: HTTP service (http.server stdlib)  │
 │  ├─ board.py: rules engine + undo-stack        │
-│  ├─ solver.py: df-pn main loop + TT            │
-│  ├─ binstore.py: binary cache format + lookup  │
+│  ├─ precompute/solver.py: df-pn main loop + TT │
+│  ├─ precompute/binstore.py: binary store format │
 │  ├─ precompute.py: multi-process coordinator   │
 │  ├─ cli_precompute.py: precompute CLI          │
 │  ├─ problems.py: problem CRUD (SQLite)         │
@@ -146,7 +146,7 @@ print(solver.solve(BLACK))
 
 ### Proof Number Search (df-pn)
 
-Located in `solver.py::DfpnSolver._mid()`. Core idea:
+Located in `precompute/solver.py::DfpnSolver._mid()`. Core idea:
 
 - Maintains two numbers per position: **pn** (cost to prove attacker wins), **dn** (cost to prove defender wins)
 - OR node (attacker's turn): pn = min(children.pn), dn = sum(children.dn)
@@ -179,8 +179,10 @@ The solver terminates a branch when:
 |------|---------|
 | `server.py` | HTTP server, route handlers, cache lookup for solve |
 | `board.py` | Board state, play/undo, group+libs, legal move generation |
-| `solver.py` | df-pn main loop, transposition table, termination checks |
-| `binstore.py` | Binary store format (.bin), BinStore mmap lookup, solve_from_store, k-way merge |
+| `precompute/solver.py` | df-pn main loop, transposition table, termination checks |
+| `precompute/binstore.py` | Binary store format (.bin), BinStore mmap lookup, solve_from_store, k-way merge |
+| `precompute/coordinator.py` | Multi-process coordinator (task queue, event loop, crash recovery) |
+| `precompute/worker.py` | Stateless worker (pulls tasks, runs df-pn with DiskTT) |
 | `precompute.py` | Multi-process worker + coordinator (parallel scheduling, progress monitoring) |
 | `cli_precompute.py` | Precompute CLI entry point (list/status/run), progress display, pypy3 switch |
 | `problems.py` | SQLite schema + CRUD for problem persistence |
@@ -247,7 +249,7 @@ CREATE TABLE problems (
 
 ### Precompute Cache
 
-Per-job binary cache in `backend/precompute/`:
+Per-job binary cache in `backend/store/`:
 - `{job_id}.bin` — Final merged TT (sorted 12-byte records: 8B key + 2B pn + 2B dn); mmap + binary search for O(log n) lookup
 - `{job_id}_w{i}.bin` — Worker i's sorted shard (temporary, deleted after merge)
 - `{job_id}_w{i}_progress.json` — Per-worker real-time stats
@@ -326,7 +328,7 @@ Example: `POST /api/custom` handler → `API.custom()` → `App.someEventListene
 
 ### Modifying the Solver
 
-Changes to `solver.py::DfpnSolver._mid()` affect all solving (precompute + lookup). Always run `test_solver.py` after changes to catch regressions.
+Changes to `precompute/solver.py::DfpnSolver._mid()` affect all solving (precompute + lookup). Always run `test_solver.py` after changes to catch regressions.
 
 Key points:
 - Termination checks in `_terminal()` must be exhaustive (missing case = wrong result)

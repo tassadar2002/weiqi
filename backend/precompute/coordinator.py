@@ -8,15 +8,21 @@ import heapq
 import json
 import multiprocessing as mp
 import os
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-from binstore import (DFPN_INF, _HEADER_SIZE, _RESULT_MAP,
-                      _calc_max_tt_entries, _calc_num_workers,
-                      _iter_records, _read_header, _write_header)
+# 直接 `pypy3 backend/precompute/coordinator.py` 运行时需要把 backend/ 加入 sys.path
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
 from board import BOARD_SIZE, Board
-from solver import DfpnSolver
-from worker import DEFAULT_BUDGET, Worker
+from precompute.binstore import (DFPN_INF, _HEADER_SIZE, _RESULT_MAP,
+                                  _calc_max_tt_entries, _calc_num_workers,
+                                  _iter_records, _read_header, _write_header)
+from precompute.solver import DfpnSolver
+from precompute.worker import DEFAULT_BUDGET, Worker
 
 
 class Coordinator:
