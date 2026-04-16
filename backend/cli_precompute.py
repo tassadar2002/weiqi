@@ -174,7 +174,7 @@ def cli_status(problem_id: str):
 # ============================================================
 
 def cli_run(problem_id: str, num_workers: Optional[int] = None):
-    """对指定题目运行预处理。"""
+    """对指定题目运行预处理。支持断点续传：复用已有 job_id，跳过已完成的根着。"""
     import threading
     import uuid as _uuid
     from coordinator import Coordinator
@@ -188,15 +188,33 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
         print(f"错误：题目 {p['name']} 未设定目标，请先在浏览器中设定", file=sys.stderr)
         sys.exit(1)
 
-    job_id = _uuid.uuid4().hex[:12]
+    # 复用已有 job_id（断点续传）或创建新的
+    job_id = p.get("precompute_job_id") or _uuid.uuid4().hex[:12]
     os.makedirs(_CACHE_DIR, exist_ok=True)
     bin_path = os.path.join(_CACHE_DIR, f"{job_id}.bin")
     progress_path = os.path.join(_CACHE_DIR, f"{job_id}_progress.json")
 
+    # 检查是否已经完成
+    if os.path.exists(bin_path):
+        hdr = _read_header(bin_path)
+        if hdr and hdr["status"] == 1:
+            print(f"题目 {p['name']} 已完成预处理（{hdr['result']}, TT={hdr['count']:,}）")
+            print("如需重新处理，请先删除缓存：rm backend/cache/{}.bin".format(job_id))
+            update_problem(_DB_PATH, problem_id,
+                           precompute_status="done", precompute_job_id=job_id)
+            return
+
+    # 检测断点续传
+    import glob as _glob
+    done_bins = _glob.glob(os.path.join(_CACHE_DIR, f"{job_id}_*_*.bin"))
+    resume = len(done_bins) > 0
+
     print(f"题目: {p['name']} ({problem_id})")
     print(f"杀目标: {p['kill_targets']}  守目标: {p['defend_targets']}")
-    print(f"job_id: {job_id}")
+    print(f"job_id: {job_id}{'  (断点续传)' if resume else ''}")
     print(f"缓存: {bin_path}")
+    if resume:
+        print(f"已有 {len(done_bins)} 个根着 .bin 文件")
     print()
 
     update_problem(_DB_PATH, problem_id,

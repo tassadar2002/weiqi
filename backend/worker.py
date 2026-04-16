@@ -11,12 +11,35 @@ import os
 import time
 from typing import List, Optional, Tuple
 
-from bincache import DiskTT
+from bincache import (DFPN_INF, DiskTT, _HEADER_FMT, _MAGIC, _RESULT_MAP,
+                      _read_header)
 from board import BOARD_SIZE, Board
 from solver import DfpnSolver
+import struct
 
 # 默认每段节点预算
 DEFAULT_BUDGET = 5_000_000
+
+
+def _mark_bin_done(bin_path: str, result: str, root_pn: int, root_dn: int) -> None:
+    """根着证明完成后，将 .bin header 的 status 标记为 done(1) 并保存根 pn/dn。
+    用于断点续传时识别"已完成"的根着。"""
+    if not os.path.exists(bin_path):
+        return
+    hdr = _read_header(bin_path)
+    if not hdr:
+        return
+    count = hdr["count"]
+    try:
+        with open(bin_path, "r+b") as f:
+            f.seek(0)
+            f.write(struct.pack(_HEADER_FMT, _MAGIC, 1, 1,  # status=1 done
+                                _RESULT_MAP.get(result, 0),
+                                count,
+                                min(root_pn, 0xFFFFFFFF),
+                                min(root_dn, 0xFFFFFFFF)))
+    except OSError:
+        pass
 
 
 class Worker:
@@ -148,6 +171,9 @@ class Worker:
                 task_queue.put(task)
                 heartbeat_queue.put(("requeue", root_move, pid))
             else:
+                # 标记 .bin 为 done，保存根 pn/dn（用于断点续传时识别）
+                bin_path = task[1]
+                _mark_bin_done(bin_path, r["result"], r["pn"], r["dn"])
                 result_queue.put((root_move, r["result"], r["pn"], r["dn"], r["nodes"]))
                 heartbeat_queue.put(("done", root_move, pid))
 

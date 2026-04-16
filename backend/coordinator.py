@@ -73,13 +73,30 @@ class Coordinator:
     # ── 队列 + Worker 启动 ──
 
     def _init_queues(self) -> None:
+        """初始化队列。跳过已完成的根着（断点续传）。"""
         self.task_queue = mp.Queue()
         self.result_queue = mp.Queue()
         self.heartbeat_queue = mp.Queue()
+        skipped = 0
         for move in self.root_moves:
             move_bin = os.path.join(self.cache_dir,
                                     f"{self.job_id}_{move[0]}_{move[1]}.bin")
+            # 检查 .bin 是否已是 done 状态（之前段已证明完）
+            if os.path.exists(move_bin):
+                hdr = _read_header(move_bin)
+                if hdr and hdr.get("status") == 1:
+                    # 直接填入 all_results，不入队
+                    self.all_results[move] = (
+                        hdr.get("result", "UNPROVEN"),
+                        hdr.get("root_pn", DFPN_INF),
+                        hdr.get("root_dn", DFPN_INF),
+                        0,  # nodes 未知（之前的运行）
+                    )
+                    skipped += 1
+                    continue
             self.task_queue.put((move, move_bin))
+        if skipped:
+            print(f"  断点续传: 跳过 {skipped} 个已完成的根着")
 
     def _start_workers(self) -> None:
         self.workers = []
@@ -287,9 +304,36 @@ class Coordinator:
 
     # ── 主入口 ──
 
+    def _kill_orphan_workers(self) -> None:
+        """清理同 job_id 的孤儿 worker 进程（之前主进程崩溃留下的）。"""
+        import signal
+        pids_path = os.path.join(self.cache_dir, f"{self.job_id}_pids.json")
+        if not os.path.exists(pids_path):
+            return
+        try:
+            with open(pids_path) as f:
+                pids = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+        killed = 0
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if killed:
+            print(f"已清理 {killed} 个孤儿 worker 进程")
+        try:
+            os.remove(pids_path)
+        except OSError:
+            pass
+
     def run(self) -> None:
         """执行完整的预处理流程。"""
         os.makedirs(self.cache_dir, exist_ok=True)
+        self._kill_orphan_workers()
 
         self.root_moves = self._gen_root_moves()
         if not self.root_moves:
