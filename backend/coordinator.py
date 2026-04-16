@@ -115,6 +115,15 @@ class Coordinator:
             p.start()
             self.workers.append(p)
 
+    def _write_root_moves(self) -> None:
+        """写入全部根着列表，供 status 命令显示完整明细。"""
+        path = os.path.join(self.data_dir, f"{self.job_id}_root_moves.json")
+        try:
+            with open(path, "w") as f:
+                json.dump([list(m) for m in self.root_moves], f)
+        except OSError:
+            pass
+
     def _write_pids(self) -> str:
         pids_path = os.path.join(self.data_dir, f"{self.job_id}_pids.json")
         try:
@@ -261,10 +270,12 @@ class Coordinator:
                 os.remove(wp)
             except OSError:
                 pass
-        try:
-            os.remove(pids_path)
-        except OSError:
-            pass
+        for path in (pids_path,
+                     os.path.join(self.data_dir, f"{self.job_id}_root_moves.json")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def _collect_worker_snapshots(self) -> List[dict]:
         """收集各 worker 的最终状态快照。"""
@@ -291,6 +302,15 @@ class Coordinator:
         elapsed_ms = int((time.monotonic() - self.start_time) * 1000)
         total_nodes = sum(v[3] for v in self.all_results.values())
         workers = self._collect_worker_snapshots()
+        # 完成后的根着列表（每个根着的最终结果）
+        kids = []
+        for move in self.root_moves:
+            r = self.all_results.get(move)
+            if r:
+                result, pn, dn, _nodes = r
+                kids.append({"move": list(move), "result": result, "pn": pn, "dn": dn})
+            else:
+                kids.append({"move": list(move), "result": "UNPROVEN"})
         with open(self.progress_path, "w") as f:
             json.dump({
                 "status": "done",
@@ -300,6 +320,7 @@ class Coordinator:
                 "done_moves": len(self.all_results),
                 "total_moves": len(self.root_moves),
                 "workers": workers,
+                "root_kids": kids,
             }, f)
 
     # ── 主入口 ──
@@ -345,6 +366,7 @@ class Coordinator:
             return
 
         self._init_queues()
+        self._write_root_moves()
         self._start_workers()
         pids_path = self._write_pids()
 

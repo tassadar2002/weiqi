@@ -127,46 +127,47 @@ def cli_status(problem_id: str):
     worker_data = (prog or {}).get("workers")
     if worker_data:
         _print_worker_table(worker_data)
-        return
-
-    # 运行中：扫描 worker progress 文件
-    pattern = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_worker*_progress.json")
-    wpaths = sorted(_glob.glob(pattern))
-    if not wpaths:
-        return
-
-    live_workers = []
-    for wp in wpaths:
-        base = os.path.basename(wp)
-        try:
-            wi = int(base.replace(f"{job_id}_worker", "").replace("_progress.json", ""))
-        except (IndexError, ValueError):
-            continue
-        try:
-            with open(wp) as f:
-                wd = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            wd = {}
-        pid = wd.get("pid")
-        snap = {
-            "worker": wi,
-            "pid": pid,
-            "status": wd.get("status", "unknown"),
-            "total_nodes": wd.get("total_nodes", 0),
-            "tasks_done": wd.get("tasks_done", 0),
-            "elapsed_ms": wd.get("elapsed_ms", 0),
-            "current_move": wd.get("current_move"),
-        }
-        if pid is not None and wd.get("status") not in ("done", "crashed"):
+    else:
+        # 运行中：扫描 worker progress 文件
+        pattern = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_worker*_progress.json")
+        wpaths = sorted(_glob.glob(pattern))
+        live_workers = []
+        for wp in wpaths:
+            base = os.path.basename(wp)
             try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                snap["status"] = "异常退出"
-            except PermissionError:
-                pass
-        live_workers.append(snap)
-    if live_workers:
-        _print_worker_table(live_workers)
+                wi = int(base.replace(f"{job_id}_worker", "").replace("_progress.json", ""))
+            except (IndexError, ValueError):
+                continue
+            try:
+                with open(wp) as f:
+                    wd = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                wd = {}
+            pid = wd.get("pid")
+            snap = {
+                "worker": wi,
+                "pid": pid,
+                "status": wd.get("status", "unknown"),
+                "total_nodes": wd.get("total_nodes", 0),
+                "tasks_done": wd.get("tasks_done", 0),
+                "elapsed_ms": wd.get("elapsed_ms", 0),
+                "current_move": wd.get("current_move"),
+            }
+            if pid is not None and wd.get("status") not in ("done", "crashed"):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    snap["status"] = "异常退出"
+                except PermissionError:
+                    pass
+            live_workers.append(snap)
+        if live_workers:
+            _print_worker_table(live_workers)
+
+    # ---- 根着明细 ----
+    kids = _collect_root_kids_status(job_id, prog)
+    if kids:
+        _print_root_kids_table(kids)
 
 
 # ============================================================
@@ -319,6 +320,143 @@ def _fmt_duration(ms: int) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _fmt_size(b: int) -> str:
+    if b >= 1024 * 1024:
+        return f"{b/1024/1024:.1f} MB"
+    if b >= 1024:
+        return f"{b/1024:.1f} KB"
+    return f"{b} B"
+
+
+def _collect_root_kids_status(job_id: str, prog: Optional[dict] = None) -> list:
+    """收集所有根着的状态。
+
+    根着完整列表优先来自：
+      - 运行中：{job_id}_root_moves.json
+      - 已完成：progress.json 的 root_kids 字段
+    若两者都没有，则回退为只列出有 .bin 或正在 run 的根着。
+    """
+    import glob as _glob
+
+    # 完成后的快照：直接用 progress.json 的 root_kids
+    if prog and prog.get("root_kids"):
+        return [{
+            "move": tuple(k["move"]),
+            "status": "done",
+            "result": k.get("result"),
+            "tt_count": 0,
+            "file_size": 0,
+            "pid": None,
+        } for k in prog["root_kids"]]
+
+    # 1. 读所有根着列表
+    all_moves = []
+    rm_path = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_root_moves.json")
+    try:
+        with open(rm_path) as f:
+            all_moves = [tuple(m) for m in json.load(f)]
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    # 2. 读 worker progress 找出 current_move → pid 映射
+    worker_pattern = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_worker*_progress.json")
+    in_flight = {}  # (x,y) → (pid, tt_size)
+    for wp in _glob.glob(worker_pattern):
+        try:
+            with open(wp) as f:
+                wd = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        cm = wd.get("current_move")
+        if cm and wd.get("status") == "running":
+            in_flight[tuple(cm)] = (wd.get("pid"), wd.get("tt_size", 0))
+
+    # 3. 扫描 {job_id}_{x}_{y}.bin 文件
+    bin_info = {}  # (x,y) → (status, result, count, size)
+    pattern = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_*_*.bin")
+    for bp in _glob.glob(pattern):
+        base = os.path.basename(bp).replace(f"{job_id}_", "").replace(".bin", "")
+        parts = base.split("_")
+        if len(parts) != 2:
+            continue
+        try:
+            x, y = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        hdr = _read_header(bp)
+        if not hdr:
+            continue
+        bin_info[(x, y)] = (hdr["status"], hdr["result"], hdr["count"], os.path.getsize(bp))
+
+    # 4. 合并：以 all_moves 为完整列表（若可用），否则用 bin + in_flight 的并集
+    if not all_moves:
+        all_moves = sorted(set(bin_info) | set(in_flight))
+
+    kids = []
+    for move in all_moves:
+        bi = bin_info.get(move)
+        ifl = in_flight.get(move)
+        if bi:
+            bin_status, result, count, size = bi
+            if bin_status == 1:
+                status = "done"
+            elif move in in_flight:
+                status = "running"
+            else:
+                status = "partial"
+            kids.append({
+                "move": move, "status": status,
+                "result": result if bin_status == 1 else None,
+                "tt_count": count, "file_size": size,
+                "pid": ifl[0] if ifl else None,
+            })
+        elif ifl:
+            kids.append({
+                "move": move, "status": "running", "result": None,
+                "tt_count": ifl[1], "file_size": 0, "pid": ifl[0],
+            })
+        else:
+            kids.append({
+                "move": move, "status": "queued", "result": None,
+                "tt_count": 0, "file_size": 0, "pid": None,
+            })
+    return kids
+
+
+def _print_root_kids_table(kids: list) -> None:
+    """打印根着明细表。"""
+    print()
+    print("根着明细:")
+    fmt = "  {:<10s}  {:<10s}  {:>12s}  {:<18s}  {}"
+    print(fmt.format("坐标", "状态", "TT条目", "结果", "备注"))
+    print("  " + "-" * 70)
+    counts = {"done": 0, "running": 0, "partial": 0, "queued": 0}
+    for k in sorted(kids, key=lambda x: x["move"]):
+        coord = f"({k['move'][0]}, {k['move'][1]})"
+        if k["status"] == "done":
+            st_label = "✓ 已完成"
+            note = _fmt_size(k["file_size"]) if k["file_size"] else ""
+        elif k["status"] == "running":
+            st_label = "⋯ 运行中"
+            size_str = _fmt_size(k["file_size"]) if k["file_size"] else "内存中"
+            note = f"pid={k['pid']}  ({size_str})"
+        elif k["status"] == "partial":
+            st_label = "· 进行中"
+            note = f"{_fmt_size(k['file_size'])}  (无 worker)"
+        else:  # queued
+            st_label = "○ 排队中"
+            note = ""
+        counts[k["status"]] = counts.get(k["status"], 0) + 1
+        result = k.get("result") or "—"
+        tt = f"{k['tt_count']:,}" if k["tt_count"] else "—"
+        print(fmt.format(coord, st_label, tt, result, note))
+    total = len(kids)
+    if total:
+        print(f"\n  共 {total} 个根着: 已完成 {counts['done']}, "
+              f"运行中 {counts['running']}, 进行中 {counts['partial']}, "
+              f"排队中 {counts['queued']}")
 
 
 def _progress_printer(progress_path: str, stop_event):
