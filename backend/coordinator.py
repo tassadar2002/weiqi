@@ -11,7 +11,7 @@ import os
 import time
 from typing import Dict, List, Optional, Tuple
 
-from bincache import (DFPN_INF, _HEADER_SIZE, _RESULT_MAP,
+from binstore import (DFPN_INF, _HEADER_SIZE, _RESULT_MAP,
                       _calc_max_tt_entries, _calc_num_workers,
                       _iter_records, _read_header, _write_header)
 from board import BOARD_SIZE, Board
@@ -40,7 +40,7 @@ class Coordinator:
 
         self.num_workers = num_workers or _calc_num_workers()
         self.max_entries = _calc_max_tt_entries(self.num_workers)
-        self.cache_dir = os.path.dirname(bin_path) or "."
+        self.data_dir = os.path.dirname(bin_path) or "."
         self.job_id = os.path.splitext(os.path.basename(bin_path))[0]
 
         self.task_queue: Optional[mp.Queue] = None
@@ -79,7 +79,7 @@ class Coordinator:
         self.heartbeat_queue = mp.Queue()
         skipped = 0
         for move in self.root_moves:
-            move_bin = os.path.join(self.cache_dir,
+            move_bin = os.path.join(self.data_dir,
                                     f"{self.job_id}_{move[0]}_{move[1]}.bin")
             # 检查 .bin 是否已是 done 状态（之前段已证明完）
             if os.path.exists(move_bin):
@@ -102,7 +102,7 @@ class Coordinator:
         self.workers = []
         self.worker_progress = []
         for wi in range(self.num_workers):
-            wp = os.path.join(self.cache_dir,
+            wp = os.path.join(self.data_dir,
                               f"{self.job_id}_worker{wi}_progress.json")
             self.worker_progress.append(wp)
             p = mp.Process(target=Worker.run, args=(
@@ -116,7 +116,7 @@ class Coordinator:
             self.workers.append(p)
 
     def _write_pids(self) -> str:
-        pids_path = os.path.join(self.cache_dir, f"{self.job_id}_pids.json")
+        pids_path = os.path.join(self.data_dir, f"{self.job_id}_pids.json")
         try:
             with open(pids_path, "w") as f:
                 json.dump([p.pid for p in self.workers], f)
@@ -152,7 +152,7 @@ class Coordinator:
             dead_pid = p.pid
             for m in [m for m, pid in self.in_flight.items() if pid == dead_pid]:
                 if m not in self.all_results:
-                    move_bin = os.path.join(self.cache_dir,
+                    move_bin = os.path.join(self.data_dir,
                                             f"{self.job_id}_{m[0]}_{m[1]}.bin")
                     self.task_queue.put((m, move_bin))
                 self.in_flight.pop(m, None)
@@ -228,7 +228,7 @@ class Coordinator:
 
         bin_paths = []
         for move in self.all_results:
-            bp = os.path.join(self.cache_dir,
+            bp = os.path.join(self.data_dir,
                               f"{self.job_id}_{move[0]}_{move[1]}.bin")
             if os.path.exists(bp) and os.path.getsize(bp) >= _HEADER_SIZE:
                 bin_paths.append(bp)
@@ -307,7 +307,7 @@ class Coordinator:
     def _kill_orphan_workers(self) -> None:
         """清理同 job_id 的孤儿 worker 进程（之前主进程崩溃留下的）。"""
         import signal
-        pids_path = os.path.join(self.cache_dir, f"{self.job_id}_pids.json")
+        pids_path = os.path.join(self.data_dir, f"{self.job_id}_pids.json")
         if not os.path.exists(pids_path):
             return
         try:
@@ -332,7 +332,7 @@ class Coordinator:
 
     def run(self) -> None:
         """执行完整的预处理流程。"""
-        os.makedirs(self.cache_dir, exist_ok=True)
+        os.makedirs(self.data_dir, exist_ok=True)
         self._kill_orphan_workers()
 
         self.root_moves = self._gen_root_moves()

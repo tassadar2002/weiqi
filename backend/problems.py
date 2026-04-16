@@ -134,8 +134,8 @@ def update_problem(db_path: str, problem_id: str, **fields) -> bool:
     return c.rowcount > 0
 
 
-def delete_problem(db_path: str, problem_id: str, cache_dir: str = "") -> bool:
-    # 先获取 job_id 以删缓存
+def delete_problem(db_path: str, problem_id: str, data_dir: str = "") -> bool:
+    """删除习题，并清理关联的预处理结果文件。"""
     p = get_problem(db_path, problem_id)
     if p is None:
         return False
@@ -143,11 +143,11 @@ def delete_problem(db_path: str, problem_id: str, cache_dir: str = "") -> bool:
     db.execute("DELETE FROM problems WHERE id=?", (problem_id,))
     db.commit()
     db.close()
-    # 删除关联的预处理缓存
-    if cache_dir and p.get("precompute_job_id"):
+    # 删除关联的预处理结果
+    if data_dir and p.get("precompute_job_id"):
         jid = p["precompute_job_id"]
         import glob
-        for f in glob.glob(os.path.join(cache_dir, f"{jid}*")):
+        for f in glob.glob(os.path.join(data_dir, f"{jid}*")):
             try:
                 os.remove(f)
             except OSError:

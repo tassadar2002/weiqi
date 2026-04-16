@@ -11,7 +11,7 @@ import os
 import time
 from typing import List, Optional, Tuple
 
-from bincache import (DFPN_INF, DiskTT, _HEADER_FMT, _MAGIC, _RESULT_MAP,
+from binstore import (DFPN_INF, DiskTT, _HEADER_FMT, _MAGIC, _RESULT_MAP,
                       _read_header)
 from board import BOARD_SIZE, Board
 from solver import DfpnSolver

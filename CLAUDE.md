@@ -32,7 +32,7 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 │  server.py: HTTP service (http.server stdlib)  │
 │  ├─ board.py: rules engine + undo-stack        │
 │  ├─ solver.py: df-pn main loop + TT            │
-│  ├─ bincache.py: binary cache format + lookup  │
+│  ├─ binstore.py: binary cache format + lookup  │
 │  ├─ precompute.py: multi-process coordinator   │
 │  ├─ cli_precompute.py: precompute CLI          │
 │  ├─ problems.py: problem CRUD (SQLite)         │
@@ -55,7 +55,7 @@ Users layout Go problems (黑白子布局) → set playable regions → specify 
 
 5. **Multi-process root-splitting** (`precompute.py`): Coordinator generates root candidates; each worker solves assigned subtree → worker-local .bin → merge. Avoids lock contention.
 
-6. **Binary TT cache format** (`bincache.py`): Sorted 12-byte records (8B key + 2B pn + 2B dn) in `.bin` files; mmap + binary search for O(log n) lookup with ~0 memory overhead.
+6. **Binary TT cache format** (`binstore.py`): Sorted 12-byte records (8B key + 2B pn + 2B dn) in `.bin` files; mmap + binary search for O(log n) lookup with ~0 memory overhead.
 
 7. **Stateless HTTP API**: Each request includes full board state (169 integers for 13×13). No per-session state on backend; enables horizontal scaling and resilience.
 
@@ -180,7 +180,7 @@ The solver terminates a branch when:
 | `server.py` | HTTP server, route handlers, cache lookup for solve |
 | `board.py` | Board state, play/undo, group+libs, legal move generation |
 | `solver.py` | df-pn main loop, transposition table, termination checks |
-| `bincache.py` | Binary cache format (.bin), BinCache mmap lookup, solve_from_cache, k-way merge |
+| `binstore.py` | Binary store format (.bin), BinStore mmap lookup, solve_from_store, k-way merge |
 | `precompute.py` | Multi-process worker + coordinator (parallel scheduling, progress monitoring) |
 | `cli_precompute.py` | Precompute CLI entry point (list/status/run), progress display, pypy3 switch |
 | `problems.py` | SQLite schema + CRUD for problem persistence |
@@ -247,7 +247,7 @@ CREATE TABLE problems (
 
 ### Precompute Cache
 
-Per-job binary cache in `backend/cache/`:
+Per-job binary cache in `backend/precompute/`:
 - `{job_id}.bin` — Final merged TT (sorted 12-byte records: 8B key + 2B pn + 2B dn); mmap + binary search for O(log n) lookup
 - `{job_id}_w{i}.bin` — Worker i's sorted shard (temporary, deleted after merge)
 - `{job_id}_w{i}_progress.json` — Per-worker real-time stats

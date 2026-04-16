@@ -18,14 +18,14 @@
 | **习题管理** | 首页列表展示所有题目；可新建、编辑、删除；每题独立存储 |
 | **布局编辑** | 13×13 棋盘，自由放置黑白子，设定可落子区域 |
 | **多目标指定** | 点白子=杀目标(红高亮)，点黑子=守目标(蓝高亮) |
-| **预处理穷举** | 命令行多进程并行 df-pn（无限制），增量写入二进制缓存，完成后结果永久缓存 |
-| **秒出最优解** | 预处理完成后，直接查 TT 缓存，毫秒级返回严格最优着 |
+| **预处理穷举** | 命令行多进程并行 df-pn（无限制），增量写入二进制存储，完成后结果永久保存 |
+| **秒出最优解** | 预处理完成后，直接查 TT 存储，毫秒级返回严格最优着 |
 | **自动对弈** | 双方按证明树落子到棋盘真正终局 |
 | **决策日志** | 每步显示攻/防角色、必胜/顽抗标签、节点数、耗时 |
 
 ### 1.3 核心设计理念
 
-**"先穷举，后查表"** —— 不追求在线实时求解的速度优化，而是靠预处理一次性算完+缓存。
+**"先穷举，后查表"** —— 不追求在线实时求解的速度优化，而是靠预处理一次性算完并保存。
 
 结果是：
 - 只需要耐心等待预处理完成（分钟到小时级）
@@ -48,7 +48,7 @@
                                               ↓
                                     多进程并行穷举 df-pn
                                     终端实时显示进度
-                                    TT 条目增量写入二进制缓存
+                                    TT 条目增量写入二进制文件
                                               ↓
                                     预处理完成 → 浏览器"最优解"秒出
 ```
@@ -77,8 +77,9 @@
 │  board.js   [极简数据]    │  /api/solve            │  eyes.py    真眼判定          │
 │  region.js  [区域掩码]    │  /api/validate_target  │  target.py  目标构造          │
 │  api.js     [fetch 包装] │                        │  solver.py  df-pn 求解器      │
-│  renderer.js [Canvas]    │                        │  precompute.py 多进程预处理      │
-│                          │                        │  bincache.py   二进制缓存+查表   │
+│  renderer.js [Canvas]    │                        │  coordinator.py 多进程协调      │
+│                          │                        │  worker.py     单 worker 执行   │
+│                          │                        │  binstore.py   二进制存储+查表   │
 │                          │                        │  cli_precompute.py 预处理CLI     │
 │  app.js     [FSM 控制]   │ ←──────────────────   │  problems.py 习题 CRUD        │
 └──────────────────────────┘                        └──────────────────────────────┘
@@ -88,18 +89,18 @@
 
 | 模式 | 触发 | 过程 | 结果 |
 |---|---|---|---|
-| **预处理（主要）** | 命令行 `cli_precompute.py run` | 多进程无限制穷举 → 全量 TT 写入二进制缓存 (.bin) | 永久缓存，毫秒级查询 |
+| **预处理（主要）** | 命令行 `cli_precompute.py run` | 多进程无限制穷举 → 全量 TT 写入二进制存储 (.bin) | 永久保存，毫秒级查询 |
 | **查表（预处理后）** | 用户点"最优解" | mmap 打开 .bin → 二分查找 pn/dn → 遍历子节点找 pn=0 的着 | 不跑 df-pn，纯查表 |
 
-**预处理完成后的查询不需要**：跨请求 TT 缓存、vitalness 破平、走法排序、穷举根证明、顽抗着选择。这些仅在"在线实时求解"场景下有用，预处理模式下全部冗余。
+**预处理完成后的查询不需要**：vitalness 破平、走法排序、穷举根证明、顽抗着选择。这些仅在"在线实时求解"场景下有用，预处理模式下全部冗余。
 
 ### 2.3 数据存储
 
 | 存储 | 位置 | 用途 |
 |---|---|---|
 | 习题数据库 | `backend/data/problems.db` | 习题的布局、区域、目标、状态 |
-| 预处理缓存 | `backend/cache/{job_id}.bin` | 每题的完整 TT（排序二进制记录，mmap 查询） |
-| 预处理进度 | `backend/cache/{job_id}_progress.json` | 实时进度（CLI 终端 / status 命令读取） |
+| 预处理结果 | `backend/precompute/{job_id}.bin` | 每题的完整 TT（排序二进制记录，mmap 查询） |
+| 预处理进度 | `backend/precompute/{job_id}_progress.json` | 实时进度（CLI 终端 / status 命令读取） |
 
 全部 SQLite + JSON，无需任何数据库服务。
 
@@ -144,11 +145,10 @@
 
 | 特性 | 预处理时 | 查表时 | 说明 |
 |---|---|---|---|
-| 转置表 (TT) | 需要 | 从 .bin 缓存 mmap 加载 | df-pn 的核心数据结构 |
+| 转置表 (TT) | 需要 | 从 .bin 文件 mmap 加载 | df-pn 的核心数据结构 |
 | 走法排序 | 需要 | 不需要 | 好的排序加快穷举收敛 |
 | `try/finally` play/undo | 需要 | 不需要 | 防止异常导致棋盘脏 |
 | `progress_callback` | 需要 | 不需要 | 报告穷举进度 |
-| 跨请求 TT 缓存 | 不需要 | 不需要 | SQLite 已是完整持久缓存 |
 | Vitalness 破平 | 不需要 | 不需要 | 穷举后所有胜着都已证完，查表时直接遍历 |
 | 穷举根证明 | 不需要 | 不需要 | 预处理本身就穷举所有 |
 | 顽抗着逻辑 | 不需要 | 查表时用简化版 | 落败方从 TT 中选任意合法着即可 |
@@ -156,7 +156,7 @@
 ### 3.6 查表阶段的求解逻辑
 
 ```python
-def solve_from_cache(tt, board, turn, region_mask, kill_targets, defend_targets, attacker_color):
+def solve_from_store(store, board, turn, region_mask, kill_targets, defend_targets, attacker_color):
     """
     预处理完成后的查表求解。不跑 df-pn，纯查 TT。
     """
@@ -250,7 +250,7 @@ def solve_from_cache(tt, board, turn, region_mask, kill_targets, defend_targets,
 
 ### 4.1 目的
 
-对任意大小区域（包括空位 > 30）的题目，命令行无限制穷举 df-pn，结果缓存到二进制文件 (.bin)。
+对任意大小区域（包括空位 > 30）的题目，命令行无限制穷举 df-pn，结果保存到二进制文件 (.bin)。
 
 ### 4.2 多进程并行策略：根节点分裂
 
@@ -302,7 +302,7 @@ solver = DfpnSolver(
     kill_targets=..., defend_targets=..., attacker_color=...,
     max_nodes=10**18,        # 等效无限
     max_time_ms=10**18,      # 等效无限
-    reuse_tt=False,          # 不用跨请求缓存（有 SQLite）
+    tt=disk_tt,              # 外部 DiskTT（内存缓冲 + 磁盘 mmap）
     progress_callback=on_progress,  # 进度回调
 )
 ```
@@ -371,9 +371,9 @@ CREATE TABLE problems (
 
 | 端点 | 请求 | 响应 |
 |---|---|---|
-| `POST /api/solve` | `{board, last_capture, region, target: {kill_targets_coords, defend_targets_coords, attacker_color}, turn, precompute_cache_id}` | `{result, move, multi_status}` |
+| `POST /api/solve` | `{board, last_capture, region, target: {kill_targets_coords, defend_targets_coords, attacker_color}, turn, precompute_job_id}` | `{result, move, multi_status}` |
 
-预处理完成后的 solve **不跑 df-pn**，只从 .bin 缓存 mmap 查表。响应中没有 nodes/elapsed_ms/pn/dn（因为不搜索）。
+预处理完成后的 solve **不跑 df-pn**，只从 .bin 文件 mmap 查表。响应中没有 nodes/elapsed_ms/pn/dn（因为不搜索）。
 
 ### 6.4 预处理（命令行）
 
@@ -410,18 +410,19 @@ weiqi3/
 │   ├── eyes.py              严格真眼判定（绑定特定群）
 │   ├── target.py            validate_target_stone
 │   ├── solver.py            DfpnSolver（df-pn + TT + 多目标终止 + 进度回调）
-│   ├── bincache.py          二进制缓存格式 + BinCache mmap 查表 + k-way 合并
-│   ├── precompute.py        多进程并行预处理（worker + coordinator）
+│   ├── binstore.py          二进制存储格式 + BinStore mmap 查表 + DiskTT + k-way 合并
+│   ├── coordinator.py       Coordinator（任务队列 + 事件循环 + 崩溃恢复）
+│   ├── worker.py            Worker（无状态任务执行器）
 │   ├── cli_precompute.py    预处理 CLI（list/status/run）
 │   ├── problems.py          习题 CRUD（problems.db 读写）
 │   ├── data/                习题数据库目录
 │   │   └── problems.db
-│   ├── cache/               预处理缓存目录
-│   │   ├── {job_id}.bin               每题的完整 TT（排序二进制，mmap 查询）
-│   │   ├── {job_id}_w{i}.bin          worker 分片（合并后自动删除）
-│   │   ├── {job_id}_w{i}_progress.json  worker 实时进度
-│   │   ├── {job_id}_progress.json     汇总进度（含 worker 快照）
-│   │   └── {job_id}_pids.json         worker PID 列表（完成后删除）
+│   ├── precompute/          预处理结果目录
+│   │   ├── {job_id}.bin                   每题的完整 TT（排序二进制，mmap 查询）
+│   │   ├── {job_id}_{x}_{y}.bin           per-root 分片（合并后自动删除）
+│   │   ├── {job_id}_worker{i}_progress.json  worker 实时进度
+│   │   ├── {job_id}_progress.json         汇总进度（含 worker 快照）
+│   │   └── {job_id}_pids.json             worker PID 列表（完成后删除）
 │   └── README.md
 │
 ├── arch.md                  本文件（完整架构，可据此复刻）

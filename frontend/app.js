@@ -401,7 +401,7 @@ class App {
     const r = await API.solve(
       this.board.toArray(), this.board.lastCapture,
       Array.from(this.regionMask), this.targetInfo, color,
-      { cacheId: this.precomputeJobId, maxTimeMs: 300000, maxNodes: 50000000 },
+      { jobId: this.precomputeJobId, maxTimeMs: 300000, maxNodes: 50000000 },
     );
     if (!r.move) {
       this.waitingForAI = false;

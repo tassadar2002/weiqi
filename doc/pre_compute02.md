@@ -2,7 +2,7 @@
 
 ## 背景
 
-预处理系统对每个习题做 df-pn 穷举证明，生成 TT 缓存供解题查表。原架构存在三个问题：
+预处理系统对每个习题做 df-pn 穷举证明，生成 TT 存储供解题查表。原架构存在三个问题：
 
 1. **内存不可控**：单个 worker 的 `solver.tt`（Python dict）随搜索无限增长，大题目 OOM
 2. **负载不均**：静态分桶（LPT），某些 worker 跑数小时，其他空闲等待
@@ -84,7 +84,7 @@ while True:
 │  mem: dict     ← O(1) 查询    │
 │  (容量有限，满则 flush)       │
 │                               │
-│  disk: BinCache ← O(log N)   │
+│  disk: BinStore ← O(log N)   │
 │  (mmap 二分查找，容量无限)    │
 │                               │
 │  get: mem → miss → disk       │
@@ -181,7 +181,7 @@ T38                       W0: A 最终完成?     (看队列是否还有 A)
 
 | 文件 | 改动 |
 |------|------|
-| `backend/bincache.py` | 新增 `DiskTT`、`_calc_max_tt_entries()`、`_calc_num_workers()`、`_merge_flush()` |
+| `backend/binstore.py` | 新增 `DiskTT`、`_calc_max_tt_entries()`、`_calc_num_workers()`、`_merge_flush()` |
 | `backend/solver.py` | `__init__` 新增 `tt` 参数；`_tt_get`/`_tt_set`/`_check_limits` 适配 DiskTT |
 | `backend/precompute.py` | 重写：`_worker_loop`（无状态）、`run_precompute_parallel`（事件循环 + 崩溃恢复）；删除静态分桶 |
 

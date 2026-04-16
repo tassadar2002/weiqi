@@ -37,7 +37,7 @@ const API = {
       board: boardArr, last_capture: lastCapture, region, target, turn,
       max_time_ms: opts.maxTimeMs || 60000,
       max_nodes: opts.maxNodes || 5000000,
-      precompute_cache_id: opts.cacheId || null,
+      precompute_job_id: opts.jobId || null,
     });
   },
 

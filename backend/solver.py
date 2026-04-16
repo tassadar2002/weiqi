@@ -2,7 +2,7 @@
 df-pn 求解器（简化版，面向预处理）
 
 职责：穷举证明。不含跨请求缓存、vitalness、穷举根证明等在线优化。
-预处理完成后查询走 solve_from_cache（在 precompute.py 中）。
+预处理完成后查询走 solve_from_store（在 binstore.py 中）。
 
 保留：
   - TT 转置表（df-pn 核心）

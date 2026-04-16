@@ -15,12 +15,12 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bincache import _read_header
+from binstore import _read_header
 from board import BLACK
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DB_PATH = os.path.join(_PROJECT_ROOT, "backend", "data", "problems.db")
-_CACHE_DIR = os.path.join(_PROJECT_ROOT, "backend", "cache")
+_PRECOMPUTE_DIR = os.path.join(_PROJECT_ROOT, "backend", "precompute")
 
 
 # ============================================================
@@ -79,8 +79,8 @@ def cli_status(problem_id: str):
         return
 
     print(f"job_id: {job_id}")
-    bin_path = os.path.join(_CACHE_DIR, f"{job_id}.bin")
-    progress_path = os.path.join(_CACHE_DIR, f"{job_id}_progress.json")
+    bin_path = os.path.join(_PRECOMPUTE_DIR, f"{job_id}.bin")
+    progress_path = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_progress.json")
 
     # 读 .bin header
     if os.path.exists(bin_path):
@@ -130,7 +130,7 @@ def cli_status(problem_id: str):
         return
 
     # 运行中：扫描 worker progress 文件
-    pattern = os.path.join(_CACHE_DIR, f"{job_id}_worker*_progress.json")
+    pattern = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_worker*_progress.json")
     wpaths = sorted(_glob.glob(pattern))
     if not wpaths:
         return
@@ -190,23 +190,23 @@ def cli_run(problem_id: str, num_workers: Optional[int] = None):
 
     # 复用已有 job_id（断点续传）或创建新的
     job_id = p.get("precompute_job_id") or _uuid.uuid4().hex[:12]
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    bin_path = os.path.join(_CACHE_DIR, f"{job_id}.bin")
-    progress_path = os.path.join(_CACHE_DIR, f"{job_id}_progress.json")
+    os.makedirs(_PRECOMPUTE_DIR, exist_ok=True)
+    bin_path = os.path.join(_PRECOMPUTE_DIR, f"{job_id}.bin")
+    progress_path = os.path.join(_PRECOMPUTE_DIR, f"{job_id}_progress.json")
 
     # 检查是否已经完成
     if os.path.exists(bin_path):
         hdr = _read_header(bin_path)
         if hdr and hdr["status"] == 1:
             print(f"题目 {p['name']} 已完成预处理（{hdr['result']}, TT={hdr['count']:,}）")
-            print("如需重新处理，请先删除缓存：rm backend/cache/{}.bin".format(job_id))
+            print("如需重新处理，请先删除：rm backend/precompute/{}.bin".format(job_id))
             update_problem(_DB_PATH, problem_id,
                            precompute_status="done", precompute_job_id=job_id)
             return
 
     # 检测断点续传
     import glob as _glob
-    done_bins = _glob.glob(os.path.join(_CACHE_DIR, f"{job_id}_*_*.bin"))
+    done_bins = _glob.glob(os.path.join(_PRECOMPUTE_DIR, f"{job_id}_*_*.bin"))
     resume = len(done_bins) > 0
 
     print(f"题目: {p['name']} ({problem_id})")

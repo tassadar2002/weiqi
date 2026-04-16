@@ -1,5 +1,7 @@
 """
-二进制 TT 缓存格式 + 查表求解
+预处理 TT 二进制存储 + 查表求解
+
+.bin 文件是预处理产生的必需数据，没有它就无法解题。
 
 格式 (.bin):
   Header (20B): magic "WQ3C" + version u8 + status u8 + result u8 + pad u8
@@ -198,10 +200,10 @@ def _merge_worker_bins(workers: List[dict], main_bin_path: str,
 
 
 # ============================================================
-# BinCache: mmap + 二分查找
+# BinStore: mmap + 二分查找
 # ============================================================
 
-class BinCache:
+class BinStore:
     """mmap 映射 .bin 文件，二分查找按需查询。内存占用 ~0。"""
 
     def __init__(self, path: str):
@@ -323,11 +325,11 @@ class DiskTT:
         self.bin_path = bin_path
         self.max_entries = max_entries
         self.mem: Dict[tuple, Tuple[int, int]] = {}
-        self.disk: Optional[BinCache] = None
+        self.disk: Optional[BinStore] = None
         self._flush_count = 0
         # .bin 已存在（之前的段的 checkpoint）→ 打开磁盘层
         if os.path.exists(bin_path) and os.path.getsize(bin_path) >= _HEADER_SIZE:
-            self.disk = BinCache(bin_path)
+            self.disk = BinStore(bin_path)
 
     def get(self, key: tuple) -> Tuple[int, int]:
         r = self.mem.get(key)
@@ -367,7 +369,7 @@ class DiskTT:
         if self.disk:
             self.disk.close()
         os.replace(tmp_path, self.bin_path)
-        self.disk = BinCache(self.bin_path)
+        self.disk = BinStore(self.bin_path)
         self.mem.clear()
         self._flush_count += 1
 
@@ -393,13 +395,13 @@ class DiskTT:
 # 查表求解（预处理完成后）
 # ============================================================
 
-def solve_from_cache(cache: BinCache,
+def solve_from_store(store: BinStore,
                      board: Board, turn: int, region_mask: List[int],
                      attacker_color: int) -> dict:
     """纯查表（mmap 二分查找），不跑 df-pn。毫秒级。"""
 
     def tt_lookup(t: int) -> Tuple[int, int]:
-        r = cache.lookup((board.zh, t, board.last_capture))
+        r = store.lookup((board.zh, t, board.last_capture))
         return r if r else (1, 1)
 
     root_pn, root_dn = tt_lookup(turn)
